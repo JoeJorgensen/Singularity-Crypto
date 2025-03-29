@@ -10,7 +10,7 @@ plotly==5.18.0
 
 # Async/websocket support
 aiohttp>=3.8.4  # For async HTTP requests
-websockets>=11.0.3  # Required for async websocket support
+websockets>=10.2,<11.0  # Must be <11.0 for compatibility with alpaca-py==0.10.0
 websocket-client==1.6.4  # For synchronous websocket fallback
 
 # Technical analysis
@@ -53,6 +53,6 @@ tqdm>=4.66.1  # For progress bars
 # Added from the code block
 matplotlib==3.8.2
 pymongo==4.6.1
-pydantic==2.5.2
+pydantic>=1.9.0,<2.0.0  # Must be <2.0.0 for compatibility with alpaca-py==0.10.0
 scipy==1.11.4
 
