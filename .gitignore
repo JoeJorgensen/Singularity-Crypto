@@ -2,3 +2,11 @@ venv/
 __pycache__/
 *.pyc
 .cursorignore
+.env
+*.env
+.DS_Store
+.vscode/
+keys/
+credentials/
+*.log
+data/local/
