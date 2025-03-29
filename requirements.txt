@@ -16,8 +16,7 @@ websocket-client==1.6.4  # For synchronous websocket fallback
 # Technical analysis
 ta==0.11.0
 pandas_ta==0.3.14b0  # Pinned version for numpy compatibility
-# TA-Lib==0.6.3  # Removed - requires C library that's not available on Streamlit Cloud
-ta-lib-bin==0.4.28  # Python-only alternative that doesn't require C library
+# TA-Lib and ta-lib-bin removed - not compatible with Python 3.12 on Streamlit Cloud
 
 # API integrations
 finnhub-python>=2.4.20

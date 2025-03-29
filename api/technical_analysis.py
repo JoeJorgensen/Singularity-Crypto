@@ -3,28 +3,11 @@ Technical analysis module for generating trading signals.
 """
 import numpy as np
 import pandas as pd
-try:
-    # Try to import from TA-Lib first
-    import talib
-except ImportError:
-    # Fall back to ta-lib-bin if TA-Lib is not available
-    try:
-        import talib.abstract as abstract_talib
-        # Create a compatibility layer
-        class TalibCompat:
-            def __getattr__(self, name):
-                # Map function calls to abstract interface
-                func = getattr(abstract_talib, name)
-                def wrapper(*args, **kwargs):
-                    # Convert first argument to numpy array explicitly if it's a pandas Series
-                    if args and hasattr(args[0], 'values'):
-                        args = list(args)
-                        args[0] = args[0].values
-                    return func(args[0], *args[1:], **kwargs)
-                return wrapper
-        talib = TalibCompat()
-    except ImportError:
-        raise ImportError("Neither TA-Lib nor ta-lib-bin is installed. Please install one of them.")
+# Remove TA-Lib dependency
+import ta
+from ta.trend import ema_indicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
 
 class TechnicalAnalysis:
     def __init__(self, config):
@@ -60,42 +43,43 @@ class TechnicalAnalysis:
         if not all(col in df.columns for col in required_columns):
             raise ValueError("DataFrame must contain OHLCV data")
         
-        # Add EMAs
-        df['ema_20'] = talib.EMA(df['close'], timeperiod=self.ema_short)
-        df['ema_50'] = talib.EMA(df['close'], timeperiod=self.ema_long)
+        # Add EMAs using TA library
+        df['ema_20'] = ema_indicator(df['close'], window=self.ema_short)
+        df['ema_50'] = ema_indicator(df['close'], window=self.ema_long)
         
         # Add RSI
-        df['rsi'] = talib.RSI(df['close'], timeperiod=self.rsi_period)
+        rsi_indicator = RSIIndicator(df['close'], window=self.rsi_period)
+        df['rsi'] = rsi_indicator.rsi()
         
         # Add MACD
-        macd, signal, hist = talib.MACD(
+        macd_indicator = MACD(
             df['close'],
-            fastperiod=self.macd_fast,
-            slowperiod=self.macd_slow,
-            signalperiod=self.macd_signal
+            window_slow=self.macd_slow, 
+            window_fast=self.macd_fast, 
+            window_sign=self.macd_signal
         )
-        df['macd'] = macd
-        df['macd_signal'] = signal
-        df['macd_hist'] = hist
+        df['macd'] = macd_indicator.macd()
+        df['macd_signal'] = macd_indicator.macd_signal()
+        df['macd_hist'] = macd_indicator.macd_diff()
         
         # Add Bollinger Bands
-        upper, middle, lower = talib.BBANDS(
+        bb_indicator = BollingerBands(
             df['close'],
-            timeperiod=self.bb_period,
-            nbdevup=self.bb_std,
-            nbdevdn=self.bb_std
+            window=self.bb_period, 
+            window_dev=self.bb_std
         )
-        df['bb_upper'] = upper
-        df['bb_middle'] = middle
-        df['bb_lower'] = lower
+        df['bb_upper'] = bb_indicator.bollinger_hband()
+        df['bb_middle'] = bb_indicator.bollinger_mavg()
+        df['bb_lower'] = bb_indicator.bollinger_lband()
         
         # Add ATR for volatility
-        df['atr'] = talib.ATR(
-            df['high'],
-            df['low'],
-            df['close'],
-            timeperiod=14
+        atr_indicator = AverageTrueRange(
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            window=14
         )
+        df['atr'] = atr_indicator.average_true_range()
         
         return df
     
