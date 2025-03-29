@@ -3,7 +3,28 @@ Technical analysis module for generating trading signals.
 """
 import numpy as np
 import pandas as pd
-import talib
+try:
+    # Try to import from TA-Lib first
+    import talib
+except ImportError:
+    # Fall back to ta-lib-bin if TA-Lib is not available
+    try:
+        import talib.abstract as abstract_talib
+        # Create a compatibility layer
+        class TalibCompat:
+            def __getattr__(self, name):
+                # Map function calls to abstract interface
+                func = getattr(abstract_talib, name)
+                def wrapper(*args, **kwargs):
+                    # Convert first argument to numpy array explicitly if it's a pandas Series
+                    if args and hasattr(args[0], 'values'):
+                        args = list(args)
+                        args[0] = args[0].values
+                    return func(args[0], *args[1:], **kwargs)
+                return wrapper
+        talib = TalibCompat()
+    except ImportError:
+        raise ImportError("Neither TA-Lib nor ta-lib-bin is installed. Please install one of them.")
 
 class TechnicalAnalysis:
     def __init__(self, config):
