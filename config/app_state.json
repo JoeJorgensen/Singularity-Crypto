@@ -1,0 +1,10 @@
+{
+    "trading_active": true,
+    "max_trades_per_day": 20,
+    "strategy_mode": "Aggressive",
+    "default_trading_pair": "ETH/USD",
+    "selected_timeframe": "1 minute",
+    "selected_candles": 100,
+    "risk_per_trade": 0.1,
+    "refresh_interval": 15
+}

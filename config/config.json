@@ -1,0 +1,91 @@
+{
+    "app_name": "Stock Trading Dashboard",
+    "version": "1.0.0",
+    
+    "data": {
+        "cache_expiry": 300,
+        "default_bars_limit": 200,
+        "default_timeframe": "1H"
+    },
+    
+    "watchlist": [
+        "AAPL",
+        "MSFT",
+        "GOOGL",
+        "AMZN",
+        "META",
+        "TSLA",
+        "NVDA",
+        "AMD",
+        "INTC",
+        "IBM"
+    ],
+    
+    "indicators": {
+        "rsi_period": 14,
+        "macd_fast_period": 12,
+        "macd_slow_period": 26,
+        "macd_signal_period": 9,
+        "ema_periods": [9, 21, 50, 200],
+        "sma_periods": [10, 20, 50, 200],
+        "bb_period": 20,
+        "bb_std_dev": 2
+    },
+    
+    "trading": {
+        "symbol": "ETHUSDT",
+        "max_position_size": 0.9,
+        "max_drawdown": 0.15,
+        "risk_per_trade": 0.02,
+        "max_trades_per_day": 5,
+        "min_risk_reward": 1.5
+    },
+    
+    "signal_thresholds": {
+        "strong_buy": 0.5,
+        "buy": 0.2,
+        "neutral_band": 0.05,
+        "sell": -0.2,
+        "strong_sell": -0.5
+    },
+    
+    "indicator_weights": {
+        "trend": 0.4,
+        "momentum": 0.3,
+        "volatility": 0.15,
+        "volume": 0.15
+    },
+    
+    "ui": {
+        "refresh_interval": 15,
+        "theme": "light",
+        "chart_height": 600,
+        "table_height": 400
+    },
+    
+    "logging": {
+        "level": "INFO",
+        "file": "logs/trading.log",
+        "max_size_mb": 10,
+        "backup_count": 5
+    },
+    
+    "technical_analysis": {
+        "ema_short": 20,
+        "ema_long": 50,
+        "rsi_period": 14,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "bb_period": 20,
+        "bb_std": 2
+    },
+    
+    "ui_settings": {
+        "auto_refresh": true,
+        "refresh_interval": 15,
+        "chart_height": 600,
+        "default_timeframe": "1h",
+        "default_candles": 100
+    }
+} 

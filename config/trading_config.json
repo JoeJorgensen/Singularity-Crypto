@@ -1,0 +1,67 @@
+{
+  "trading": {
+    "supported_pairs": ["ETH/USD", "BTC/USD", "LTC/USD", "BCH/USD", "XRP/USD"],
+    "default_pair": "ETH/USD",
+    "timeframe": "1h",
+    "position_limits": {
+      "max_position_size": 0.9,
+      "max_position_size_per_trade": 0.2,
+      "min_position_size": 0.01
+    },
+    "risk_management": {
+      "max_risk_per_trade": 0.02,
+      "max_drawdown": 0.15,
+      "min_risk_reward_ratio": 1.5,
+      "max_trades_per_day": 5,
+      "stop_loss_percent": 0.05,
+      "trailing_stop_percent": 0.02
+    }
+  },
+  "timeframes": ["1m", "5m", "15m", "30m", "1h", "1d"],
+  "signal_thresholds": {
+    "strong_buy": 0.5,
+    "buy": 0.2,
+    "neutral_band": 0.05,
+    "sell": -0.2,
+    "strong_sell": -0.5
+  },
+  "indicator_weights": {
+    "trend": 0.4,
+    "momentum": 0.3,
+    "volatility": 0.15,
+    "volume": 0.15
+  },
+  "technical_indicators": {
+    "ema": [9, 21, 50, 200],
+    "sma": [50, 200],
+    "rsi": true,
+    "rsi_period": 14,
+    "macd": true,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "bollinger_bands": true,
+    "bollinger_period": 20,
+    "bollinger_std": 2.0,
+    "stochastic": true,
+    "stochastic_k": 14,
+    "stochastic_d": 3,
+    "adx": true,
+    "adx_period": 14,
+    "atr": true,
+    "atr_period": 14
+  },
+  "ui_settings": {
+    "theme": "dark",
+    "chart_height": 500,
+    "refresh_interval": 120,
+    "auto_refresh": true,
+    "max_data_points": 100
+  },
+  "data_optimization": {
+    "enable_caching": true,
+    "cache_ttl": 60,
+    "use_simplified_indicators": true,
+    "limit_chart_points": 100
+  }
+}
