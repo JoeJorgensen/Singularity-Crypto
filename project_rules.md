@@ -26,8 +26,8 @@
    - Respect maximum trades per day (default: 5)
    - Maintain minimum risk/reward ratio (default: 1.5)
 
-2. **Trade Execution**:
-   - **CRITICAL**: Always use Alpaca's IEX and Websocket feed for market data, **never** use the SIP feed or CryptoFeed.US
+2. **Trade Execution / Data source**:
+   - **CRITICAL**: Always use Alpaca's IEX and Websocket feed for market data only use REST API for fallback datasource and  non-streaming requests like placing/canceling orders or retrieving account balances., **never** use the SIP feed or CryptoFeed.US
    - For crypto data, always use the endpoints that automatically use the IEX feed
    - For websockets, always connect to "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
    - Log all trade executions in the terminal with relevant details
@@ -183,4 +183,5 @@
    - Test resilience regularly
 
 These rules provide comprehensive guidance for development, maintenance, and operation of the CryptoTrading project. Adherence to these guidelines will ensure consistency, reliability, and safety in the automated trading system.
+
 
