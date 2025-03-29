@@ -471,6 +471,9 @@ class TradingStrategy:
         # Get min signal strength from config
         min_signal_strength = self.config.get('trading', {}).get('min_signal_strength', 0.2)
         
+        # Debug output to verify the threshold
+        logger.warning(f"DEBUG: Using min_signal_strength={min_signal_strength} (config value)")
+        
         # Check minimum strength requirement
         if abs(signal) < min_signal_strength:
             logger.info(f"Signal strength {abs(signal):.4f} is below minimum threshold {min_signal_strength}")

@@ -3,6 +3,7 @@
     "supported_pairs": ["ETH/USD", "BTC/USD", "LTC/USD", "BCH/USD", "XRP/USD"],
     "default_pair": "ETH/USD",
     "timeframe": "1h",
+    "min_signal_strength": 0.12,
     "position_limits": {
       "max_position_size": 0.9,
       "max_position_size_per_trade": 0.2,

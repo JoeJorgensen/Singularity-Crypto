@@ -27,7 +27,9 @@
    - Maintain minimum risk/reward ratio (default: 1.5)
 
 2. **Trade Execution**:
-   - Always use Alpaca's IEX and Websocket feed for market data, **never** use the SIP feed
+   - **CRITICAL**: Always use Alpaca's IEX and Websocket feed for market data, **never** use the SIP feed or CryptoFeed.US
+   - For crypto data, always use the endpoints that automatically use the IEX feed
+   - For websockets, always connect to "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
    - Log all trade executions in the terminal with relevant details
    - Implement order confirmation checks
    - Handle API errors gracefully with proper retries

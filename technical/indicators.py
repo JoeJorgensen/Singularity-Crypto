@@ -384,42 +384,63 @@ class TechnicalIndicators:
         config: Dict = None
     ) -> pd.DataFrame:
         """
-        Add all configured technical indicators to DataFrame.
+        Add all technical indicators to DataFrame.
         
         Args:
-            df: DataFrame with price data
-            config: Configuration dictionary
+            df: DataFrame with OHLCV data
+            config: Configuration dictionary with indicator settings
             
         Returns:
-            DataFrame with all indicator columns added
+            DataFrame with added indicators
         """
         if config is None:
             config = {}
-        
-        # Make a copy of the DataFrame to avoid modifying the original
+            
         df_copy = df.copy()
         
         # Add RSI
         rsi_config = config.get('rsi', {})
-        if rsi_config.get('enabled', True):
+        # Handle case where rsi is a boolean instead of a dict
+        if isinstance(rsi_config, bool):
+            rsi_enabled = rsi_config
+            rsi_period = config.get('rsi_period', 14)
+        else:
+            rsi_enabled = rsi_config.get('enabled', True)
+            rsi_period = rsi_config.get('period', 14)
+        
+        if rsi_enabled:
             df_copy = TechnicalIndicators.add_rsi(
                 df_copy,
-                period=rsi_config.get('period', 14)
+                period=rsi_period
             )
         
         # Add MACD
         macd_config = config.get('macd', {})
-        if macd_config.get('enabled', True):
+        # Handle case where macd is a boolean
+        if isinstance(macd_config, bool):
+            macd_enabled = macd_config
+            macd_fast = config.get('macd_fast', 12)
+            macd_slow = config.get('macd_slow', 26)
+            macd_signal = config.get('macd_signal', 9)
+        else:
+            macd_enabled = macd_config.get('enabled', True)
+            macd_fast = macd_config.get('fast_period', 12)
+            macd_slow = macd_config.get('slow_period', 26)
+            macd_signal = macd_config.get('signal_period', 9)
+            
+        if macd_enabled:
             df_copy = TechnicalIndicators.add_macd(
                 df_copy,
-                fast_period=macd_config.get('fast_period', 12),
-                slow_period=macd_config.get('slow_period', 26),
-                signal_period=macd_config.get('signal_period', 9)
+                fast_period=macd_fast,
+                slow_period=macd_slow,
+                signal_period=macd_signal
             )
         
         # Add EMA
-        ema_config = config.get('ema', {})
-        if ema_config.get('enabled', True):
+        ema_config = config.get('ema', [9, 21, 50, 200])
+        # Handle case where ema could be a list of periods or a dict
+        if isinstance(ema_config, dict):
+            ema_enabled = ema_config.get('enabled', True)
             periods = []
             if 'fast_period' in ema_config:
                 periods.append(ema_config['fast_period'])
@@ -427,16 +448,27 @@ class TechnicalIndicators:
                 periods.append(ema_config['slow_period'])
             if not periods:
                 periods = [9, 21]  # Default periods
+        else:
+            ema_enabled = True
+            periods = ema_config if isinstance(ema_config, list) else [9, 21]
             
+        if ema_enabled:
             df_copy = TechnicalIndicators.add_ema(
                 df_copy,
                 periods=periods
             )
         
         # Add SMA
-        sma_config = config.get('sma', {})
-        if sma_config.get('enabled', True):
+        sma_config = config.get('sma', [50, 200])
+        # Handle case where sma could be a list of periods or a dict
+        if isinstance(sma_config, dict):
+            sma_enabled = sma_config.get('enabled', True)
             periods = sma_config.get('periods', [50, 200])
+        else:
+            sma_enabled = True
+            periods = sma_config if isinstance(sma_config, list) else [50, 200]
+            
+        if sma_enabled:
             df_copy = TechnicalIndicators.add_sma(
                 df_copy,
                 periods=periods
@@ -444,47 +476,97 @@ class TechnicalIndicators:
         
         # Add Bollinger Bands
         bb_config = config.get('bollinger_bands', {})
-        if bb_config.get('enabled', True):
+        # Handle case where bb is a boolean
+        if isinstance(bb_config, bool):
+            bb_enabled = bb_config
+            bb_period = config.get('bollinger_period', 20)
+            bb_std_dev = config.get('bollinger_std', 2.0)
+        else:
+            bb_enabled = bb_config.get('enabled', True)
+            bb_period = bb_config.get('period', 20)
+            bb_std_dev = bb_config.get('std_dev', 2.0)
+            
+        if bb_enabled:
             df_copy = TechnicalIndicators.add_bollinger_bands(
                 df_copy,
-                period=bb_config.get('period', 20),
-                std_dev=bb_config.get('std_dev', 2.0)
+                period=bb_period,
+                std_dev=bb_std_dev
             )
         
         # Add ATR
         atr_config = config.get('atr', {})
-        if atr_config.get('enabled', True):
+        # Handle case where atr is a boolean
+        if isinstance(atr_config, bool):
+            atr_enabled = atr_config
+            atr_period = config.get('atr_period', 14)
+        else:
+            atr_enabled = atr_config.get('enabled', True)
+            atr_period = atr_config.get('period', 14)
+            
+        if atr_enabled:
             df_copy = TechnicalIndicators.add_atr(
                 df_copy,
-                period=atr_config.get('period', 14)
+                period=atr_period
             )
         
         # Add Stochastic
         stoch_config = config.get('stochastic', {})
-        if stoch_config.get('enabled', True):
+        # Handle case where stochastic is a boolean
+        if isinstance(stoch_config, bool):
+            stoch_enabled = stoch_config
+            k_period = config.get('stochastic_k', 14)
+            d_period = config.get('stochastic_d', 3)
+            smooth_k = 3
+        else:
+            stoch_enabled = stoch_config.get('enabled', True)
+            k_period = stoch_config.get('k_period', 14)
+            d_period = stoch_config.get('d_period', 3)
+            smooth_k = stoch_config.get('smooth_k', 3)
+            
+        if stoch_enabled:
             df_copy = TechnicalIndicators.add_stochastic(
                 df_copy,
-                k_period=stoch_config.get('k_period', 14),
-                d_period=stoch_config.get('d_period', 3),
-                smooth_k=stoch_config.get('smooth_k', 3)
+                k_period=k_period,
+                d_period=d_period,
+                smooth_k=smooth_k
             )
         
         # Add ADX
         adx_config = config.get('adx', {})
-        if adx_config.get('enabled', True):
+        # Handle case where adx is a boolean
+        if isinstance(adx_config, bool):
+            adx_enabled = adx_config
+            adx_period = config.get('adx_period', 14)
+        else:
+            adx_enabled = adx_config.get('enabled', True)
+            adx_period = adx_config.get('period', 14)
+            
+        if adx_enabled:
             df_copy = TechnicalIndicators.add_adx(
                 df_copy,
-                period=adx_config.get('period', 14)
+                period=adx_period
             )
         
         # Add Ichimoku
         ichimoku_config = config.get('ichimoku', {})
-        if ichimoku_config.get('enabled', False):  # Disabled by default
+        # Handle case where ichimoku is a boolean
+        if isinstance(ichimoku_config, bool):
+            ichimoku_enabled = ichimoku_config
+        else:
+            ichimoku_enabled = ichimoku_config.get('enabled', False)  # Disabled by default
+            
+        if ichimoku_enabled:
             df_copy = TechnicalIndicators.add_ichimoku(df_copy)
         
         # Add volume indicators
         volume_config = config.get('volume_indicators', {})
-        if volume_config.get('enabled', True):
+        # Handle case where volume_indicators is a boolean
+        if isinstance(volume_config, bool):
+            volume_enabled = volume_config
+        else:
+            volume_enabled = volume_config.get('enabled', True)
+            
+        if volume_enabled:
             df_copy = TechnicalIndicators.add_volume_indicators(df_copy)
         
         return df_copy
