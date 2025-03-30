@@ -31,35 +31,41 @@ logger = get_logger('trading_app')
 # Check for Streamlit secrets
 def verify_secrets():
     """Check if we have access to Streamlit secrets or env vars."""
+    streamlit_secrets_found = False
+    env_vars_found = False
+    
     try:
         # Check for nested Streamlit secrets structure
         if 'alpaca' in st.secrets:
             # Check for ALPACA_API_KEY in alpaca section
-            if 'ALPACA_API_KEY' in st.secrets['alpaca']:
-                logger.info("ALPACA_API_KEY found in Streamlit secrets (alpaca section)")
-                return True
-            # Check for api_key or key in alpaca section
-            elif any(k in st.secrets['alpaca'] for k in ['api_key', 'key']):
-                logger.info("api_key found in Streamlit secrets (alpaca section)")
-                return True
+            if 'ALPACA_API_KEY' in st.secrets['alpaca'] and 'ALPACA_API_SECRET' in st.secrets['alpaca']:
+                logger.info("ALPACA_API_KEY and ALPACA_API_SECRET found in Streamlit secrets (alpaca section)")
+                streamlit_secrets_found = True
+            # Check for api_key/key and api_secret/secret in alpaca section
+            elif (('api_key' in st.secrets['alpaca'] or 'key' in st.secrets['alpaca']) and 
+                 ('api_secret' in st.secrets['alpaca'] or 'secret' in st.secrets['alpaca'])):
+                logger.info("api_key/key and api_secret/secret found in Streamlit secrets (alpaca section)")
+                streamlit_secrets_found = True
             else:
-                logger.warning("alpaca section exists but credentials not found")
+                logger.warning("alpaca section exists but complete credentials not found")
         # Check for top-level credentials
-        elif 'ALPACA_API_KEY' in st.secrets:
-            logger.info("ALPACA_API_KEY found in Streamlit secrets")
-            return True
+        elif 'ALPACA_API_KEY' in st.secrets and 'ALPACA_API_SECRET' in st.secrets:
+            logger.info("ALPACA_API_KEY and ALPACA_API_SECRET found in Streamlit secrets (top level)")
+            streamlit_secrets_found = True
         else:
-            logger.warning("ALPACA_API_KEY not found in Streamlit secrets")
+            logger.warning("Complete credentials not found in Streamlit secrets")
     except Exception as e:
         logger.warning(f"Error accessing Streamlit secrets: {e}")
     
-    # Check for environment variables
-    if os.getenv('ALPACA_API_KEY'):
-        logger.info("ALPACA_API_KEY found in environment variables")
-        return True
+    # Check for environment variables - both must exist
+    if os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET'):
+        logger.info("ALPACA_API_KEY and ALPACA_API_SECRET found in environment variables")
+        env_vars_found = True
     else:
-        logger.warning("ALPACA_API_KEY not found in environment variables")
-        return False
+        logger.warning("Complete credentials not found in environment variables")
+    
+    # Return True if either source has complete credentials
+    return streamlit_secrets_found or env_vars_found
 
 def debug_secrets():
     """Debug function to display information about available secrets (safe display)."""
@@ -134,7 +140,54 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Load environment variables
-load_dotenv()
+def load_environment_variables():
+    """Load environment variables from multiple sources."""
+    # First try to load from .env file
+    load_dotenv()
+    
+    # Create a dict to hold environment vars from all sources (for debugging)
+    env_vars = {
+        "from_env_file": {},
+        "from_streamlit": {},
+        "final": {}
+    }
+    
+    # Check for env vars loaded from .env file
+    if os.getenv('ALPACA_API_KEY'):
+        env_vars["from_env_file"]["ALPACA_API_KEY"] = "Found"
+    if os.getenv('ALPACA_API_SECRET'):
+        env_vars["from_env_file"]["ALPACA_API_SECRET"] = "Found"
+    
+    # Try to check Streamlit secrets (which should be loaded automatically)
+    try:
+        if 'alpaca' in st.secrets:
+            if 'ALPACA_API_KEY' in st.secrets.alpaca:
+                env_vars["from_streamlit"]["ALPACA_API_KEY"] = "Found"
+            if 'ALPACA_API_SECRET' in st.secrets.alpaca:
+                env_vars["from_streamlit"]["ALPACA_API_SECRET"] = "Found"
+        
+        # Check final outcome (which credential source will be used)
+        # This mimics the logic in AlpacaAPI.__init__
+        if 'alpaca' in st.secrets:
+            if 'ALPACA_API_KEY' in st.secrets.alpaca:
+                env_vars["final"]["source"] = "Streamlit secrets (nested ALPACA_API_KEY)"
+            elif any(k in st.secrets.alpaca for k in ['api_key', 'key']):
+                env_vars["final"]["source"] = "Streamlit secrets (nested api_key/key)"
+        elif 'ALPACA_API_KEY' in st.secrets:
+            env_vars["final"]["source"] = "Streamlit secrets (top-level)"
+        elif os.getenv('ALPACA_API_KEY'):
+            env_vars["final"]["source"] = ".env file"
+        else:
+            env_vars["final"]["source"] = "None found"
+    except Exception as e:
+        logger.warning(f"Error checking Streamlit secrets: {e}")
+        env_vars["final"]["source"] = ".env file (error checking Streamlit)"
+    
+    logger.info(f"Environment loaded from: {env_vars['final']['source']}")
+    return env_vars
+
+# Load environment variables and show what source was used
+env_sources = load_environment_variables()
 
 # Persistent state management
 def save_persistent_state(state_data):
@@ -676,6 +729,11 @@ def main():
             with st.expander("Credentials Debug Information"):
                 st.error("⚠️ API credentials not found! Make sure ALPACA_API_KEY and ALPACA_API_SECRET are set in Streamlit secrets or environment variables.")
                 st.json(debug_secrets())
+                
+                # Show environment variables sources
+                st.subheader("Credential Sources")
+                st.json(env_sources)
+                
                 st.markdown("""
                 ### Secrets Format Help
                 Your Streamlit secrets should be formatted in one of these ways:
@@ -699,6 +757,18 @@ def main():
                 ALPACA_API_KEY = "YOUR_KEY_HERE"
                 ALPACA_API_SECRET = "YOUR_SECRET_HERE"
                 ```
+                """)
+                
+                # Add help for .env file
+                st.markdown("""
+                ### Environment File (.env) Setup
+                For local development, you can also use a `.env` file with these variables:
+                ```
+                ALPACA_API_KEY=YOUR_KEY_HERE
+                ALPACA_API_SECRET=YOUR_SECRET_HERE
+                ```
+                
+                Make sure the `.env` file is in the root directory of your project.
                 """)
         
         # Auto-refresh every 15 seconds

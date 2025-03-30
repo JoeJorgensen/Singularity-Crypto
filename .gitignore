@@ -10,3 +10,4 @@ keys/
 credentials/
 *.log
 data/local/
+.streamlit/

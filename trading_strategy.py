@@ -372,15 +372,18 @@ class TradingStrategy:
             # Determine signal direction and initial strength
             if composite_signal > 0:
                 signal_direction = "buy"
+                trade_direction = "long"
                 signal_strength = min(composite_signal, 1.0)  # Cap at 1.0
             elif composite_signal < 0:
                 signal_direction = "sell"
+                trade_direction = "short"
                 signal_strength = min(abs(composite_signal), 1.0)  # Cap at 1.0
             else:
                 signal_direction = "neutral"
+                trade_direction = "none"
                 signal_strength = 0.0
                 
-            logger.info(f"Generated {signal_direction} signal with strength {signal_strength:.4f} and direction {'long' if signal_direction == 'buy' else 'short' if signal_direction == 'sell' else 'neutral'}")
+            logger.info(f"Generated {signal_direction} signal with strength {signal_strength:.4f} and direction {trade_direction}")
             
             # Add sentiment adjustment if available
             sentiment_adjustment = 0
@@ -400,12 +403,15 @@ class TradingStrategy:
                 # Recalculate direction and strength
                 if adjusted_signal > 0:
                     signal_direction = "buy"
+                    trade_direction = "long"
                     signal_strength = min(adjusted_signal, 1.0)
                 elif adjusted_signal < 0:
                     signal_direction = "sell"
+                    trade_direction = "short"
                     signal_strength = min(abs(adjusted_signal), 1.0)
                 else:
                     signal_direction = "neutral"
+                    trade_direction = "none"
                     signal_strength = 0.0
             
             # Final signal values
@@ -415,18 +421,18 @@ class TradingStrategy:
             
             # Create signals dictionary
             signals = {
-                "timestamp": datetime.now().isoformat(),
-                "symbol": self.default_pair,
-                "signal": final_signal,
+                "signal": composite_signal,
                 "signal_direction": signal_direction,
                 "strength": signal_strength,
-                "trend_signal": trend_signal,
-                "momentum_signal": momentum_signal,
-                "volume_signal": volume_signal,
-                "volatility_signal": volatility_signal,
-                "trend": trend_signal,
-                "momentum": momentum_signal,
-                "volume": volume_signal
+                "timestamp": datetime.now().isoformat(),
+                "symbol": self.default_pair,
+                "components": {
+                    "trend": trend_signal,
+                    "momentum": momentum_signal,
+                    "volatility": volatility_signal,
+                    "volume": volume_signal,
+                    "direction": trade_direction
+                }
             }
             
             # Add sentiment data if available
@@ -467,6 +473,7 @@ class TradingStrategy:
         signal = signals.get('signal', 0)
         signal_direction = signals.get('signal_direction', 'neutral')
         signal_strength = signals.get('strength', 0)
+        trade_direction = signals.get('components', {}).get('direction', 'none')
         
         # Get min signal strength from config
         min_signal_strength = self.config.get('trading', {}).get('min_signal_strength', 0.2)
@@ -475,8 +482,8 @@ class TradingStrategy:
         logger.warning(f"DEBUG: Using min_signal_strength={min_signal_strength} (config value)")
         
         # Check minimum strength requirement
-        if abs(signal) < min_signal_strength:
-            logger.info(f"Signal strength {abs(signal):.4f} is below minimum threshold {min_signal_strength}")
+        if signal_strength < min_signal_strength:
+            logger.info(f"Signal strength {signal_strength:.4f} is below minimum threshold {min_signal_strength}")
             return False
         
         # Check for neutral signal
@@ -574,6 +581,7 @@ class TradingStrategy:
         """
         symbol = symbol or self.default_pair
         side = signals.get('signal_direction', '').lower()
+        trade_direction = signals.get('components', {}).get('direction', 'long' if side == 'buy' else 'short' if side == 'sell' else 'none')
         
         if not side or side not in ['buy', 'sell']:
             logger.error(f"Trade execution failed: Invalid side '{side}'")
@@ -655,18 +663,28 @@ class TradingStrategy:
                 
                 logger.info(f"Using buy amount of ${safe_buy_amount:.2f} (from buying power ${position_sizing_balance:.2f})")
             else:
-                # For sell orders, just use the existing position size
+                # For sells, check if we have an existing position
                 if has_existing_position and existing_position_size > 0:
-                    # Always sell 100% of the position
+                    # This is closing an existing long position
                     position_sizing_balance = existing_position_value
                     safe_buy_amount = position_sizing_balance
                     logger.info(f"Selling entire position: {existing_position_size} {symbol} worth ${existing_position_value:.2f}")
                 else:
-                    logger.error(f"Cannot sell - no existing position for {symbol}")
-                    return {
-                        "executed": False,
-                        "error": f"Cannot sell - no existing position for {symbol}"
-                    }
+                    # This is opening a new short position
+                    logger.info(f"Opening new short position for {symbol} with direction: {trade_direction}")
+                    
+                    # Use position sizing similar to buy orders but for shorts
+                    position_sizing_balance = available_balance
+                    # Additional safety buffer (5% below available)
+                    safe_buy_amount = position_sizing_balance * 0.95
+                    
+                    # For extremely low buying power, use an even more conservative approach
+                    if position_sizing_balance < 100:
+                        # Use only 70% of available buying power for very small amounts
+                        safe_buy_amount = position_sizing_balance * 0.7
+                        logger.info(f"Very low buying power (${position_sizing_balance:.2f}). Using conservative position sizing (70%) for short")
+                    
+                    logger.info(f"Using short position amount of ${safe_buy_amount:.2f} (from buying power ${position_sizing_balance:.2f})")
             
             # Check if user settings are available (look for a state file)
             strategy_mode = "Moderate"  # Default value
@@ -708,7 +726,7 @@ class TradingStrategy:
             
             # Calculate position size in quantity 
             # For buys, use safe_buy_amount / price
-            # For sells, use existing position size
+            # For sells, use existing position size if closing, or calculate new position size if shorting
             if side == 'buy':
                 position_size = safe_buy_amount / price
                 
@@ -720,14 +738,30 @@ class TradingStrategy:
                         "error": f"Position value (${position_size * price:.2f}) is below minimum threshold of $10"
                     }
             else:
-                # For sells, use the exact position size
-                position_size = existing_position_size
-                
+                # For sells, check if we're closing an existing position or opening a short
+                if has_existing_position and existing_position_size > 0:
+                    # Closing an existing long position
+                    position_size = existing_position_size
+                else:
+                    # Opening a new short position
+                    position_size = safe_buy_amount / price
+                    
+                    # Make sure the position size is not too small
+                    if position_size * price < 10 and position_size * price < safe_buy_amount * 0.9:
+                        logger.warning(f"Short position value (${position_size * price:.2f}) is below minimum. Skipping trade.")
+                        return {
+                            "executed": False,
+                            "error": f"Short position value (${position_size * price:.2f}) is below minimum threshold of $10"
+                        }
+            
             # Log position sizing details
             if side == 'buy':
                 logger.info(f"Buy position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
             else:
-                logger.info(f"Sell position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
+                if has_existing_position and existing_position_size > 0:
+                    logger.info(f"Sell existing long position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
+                else:
+                    logger.info(f"Open short position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
             
             logger.info(f"Strategy mode: {strategy_mode}")
             
@@ -742,12 +776,22 @@ class TradingStrategy:
             # Update last trade time
             self.last_trade_time = datetime.now()
             
-            logger.info(f"Trade executed: {side.upper()} {position_size} {symbol} at ~${price:.2f}")
+            # Log the executed trade with specific action type
+            if side == 'buy':
+                trade_action = "BUY (LONG)"
+            else:
+                if has_existing_position and existing_position_size > 0:
+                    trade_action = "SELL (CLOSE LONG)"
+                else:
+                    trade_action = "SELL (SHORT)"
+                
+            logger.info(f"Trade executed: {trade_action} {position_size} {symbol} at ~${price:.2f}")
             
             return {
                 "executed": True,
                 "trade": order,
                 "side": side,
+                "direction": trade_direction,
                 "qty": position_size,
                 "price": price,
                 "symbol": symbol,
