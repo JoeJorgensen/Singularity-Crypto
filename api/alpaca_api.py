@@ -34,7 +34,22 @@ class AlpacaAPI:
         # Try to get credentials from Streamlit secrets if available
         try:
             import streamlit as st
-            if 'ALPACA_API_KEY' in st.secrets:
+            # Check for credentials in nested 'alpaca' section
+            if 'alpaca' in st.secrets:
+                if 'ALPACA_API_KEY' in st.secrets['alpaca']:
+                    self.api_key = st.secrets['alpaca']['ALPACA_API_KEY']
+                    self.api_secret = st.secrets['alpaca']['ALPACA_API_SECRET']
+                    self.credentials_source = "Streamlit Secrets (nested)"
+                    print("Using Alpaca credentials from Streamlit secrets (alpaca section)")
+                else:
+                    # Try using the section directly with api_key and api_secret keys
+                    self.api_key = st.secrets['alpaca'].get('api_key') or st.secrets['alpaca'].get('key')
+                    self.api_secret = st.secrets['alpaca'].get('api_secret') or st.secrets['alpaca'].get('secret')
+                    if self.api_key and self.api_secret:
+                        self.credentials_source = "Streamlit Secrets (nested)"
+                        print("Using Alpaca credentials from Streamlit secrets (alpaca section)")
+            # Check for top-level credentials too
+            elif 'ALPACA_API_KEY' in st.secrets:
                 self.api_key = st.secrets['ALPACA_API_KEY']
                 self.api_secret = st.secrets['ALPACA_API_SECRET']
                 self.credentials_source = "Streamlit Secrets"
@@ -62,6 +77,9 @@ class AlpacaAPI:
                 import streamlit as st
                 if hasattr(st, 'secrets'):
                     error_msg += f"\nStreamlit secrets available: {list(st.secrets.keys()) if hasattr(st.secrets, 'keys') else 'No'}"
+                    # Add alpaca section details if it exists
+                    if 'alpaca' in st.secrets:
+                        error_msg += f"\nAlpaca section keys: {list(st.secrets['alpaca'].keys()) if hasattr(st.secrets['alpaca'], 'keys') else 'No keys'}"
             except:
                 pass
                 

@@ -32,8 +32,20 @@ logger = get_logger('trading_app')
 def verify_secrets():
     """Check if we have access to Streamlit secrets or env vars."""
     try:
-        # Check for Streamlit secrets
-        if 'ALPACA_API_KEY' in st.secrets:
+        # Check for nested Streamlit secrets structure
+        if 'alpaca' in st.secrets:
+            # Check for ALPACA_API_KEY in alpaca section
+            if 'ALPACA_API_KEY' in st.secrets['alpaca']:
+                logger.info("ALPACA_API_KEY found in Streamlit secrets (alpaca section)")
+                return True
+            # Check for api_key or key in alpaca section
+            elif any(k in st.secrets['alpaca'] for k in ['api_key', 'key']):
+                logger.info("api_key found in Streamlit secrets (alpaca section)")
+                return True
+            else:
+                logger.warning("alpaca section exists but credentials not found")
+        # Check for top-level credentials
+        elif 'ALPACA_API_KEY' in st.secrets:
             logger.info("ALPACA_API_KEY found in Streamlit secrets")
             return True
         else:
@@ -48,6 +60,23 @@ def verify_secrets():
     else:
         logger.warning("ALPACA_API_KEY not found in environment variables")
         return False
+
+def debug_secrets():
+    """Debug function to display information about available secrets (safe display)."""
+    try:
+        debug_info = {
+            "st.secrets available": hasattr(st, 'secrets'),
+            "top level keys": list(st.secrets.keys()) if hasattr(st, 'secrets') else [],
+        }
+        
+        # Check for alpaca section
+        if 'alpaca' in st.secrets:
+            # Only show keys, not values
+            debug_info["alpaca keys"] = list(st.secrets.alpaca.keys()) if hasattr(st.secrets.alpaca, 'keys') else "Not a dict"
+        
+        return debug_info
+    except Exception as e:
+        return {"error": str(e)}
 
 # Configure Streamlit page
 st.set_page_config(
@@ -643,7 +672,34 @@ def main():
         # Verify API credentials
         credentials_available = verify_secrets()
         if not credentials_available:
-            st.error("⚠️ API credentials not found! Make sure ALPACA_API_KEY and ALPACA_API_SECRET are set in Streamlit secrets or environment variables.")
+            # Show more detailed error with debug information about secrets
+            with st.expander("Credentials Debug Information"):
+                st.error("⚠️ API credentials not found! Make sure ALPACA_API_KEY and ALPACA_API_SECRET are set in Streamlit secrets or environment variables.")
+                st.json(debug_secrets())
+                st.markdown("""
+                ### Secrets Format Help
+                Your Streamlit secrets should be formatted in one of these ways:
+                
+                **Option 1: Nested format (recommended)**
+                ```toml
+                [alpaca]
+                ALPACA_API_KEY = "YOUR_KEY_HERE"
+                ALPACA_API_SECRET = "YOUR_SECRET_HERE"
+                ```
+                
+                **Option 2: Alternative nested format**
+                ```toml
+                [alpaca]
+                api_key = "YOUR_KEY_HERE" 
+                api_secret = "YOUR_SECRET_HERE"
+                ```
+                
+                **Option 3: Top-level format**
+                ```toml
+                ALPACA_API_KEY = "YOUR_KEY_HERE"
+                ALPACA_API_SECRET = "YOUR_SECRET_HERE"
+                ```
+                """)
         
         # Auto-refresh every 15 seconds
         refresh_interval = st.sidebar.slider(
