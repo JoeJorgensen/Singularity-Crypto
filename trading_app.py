@@ -28,6 +28,27 @@ from utils.logging_config import setup_logging, get_logger
 setup_logging()
 logger = get_logger('trading_app')
 
+# Check for Streamlit secrets
+def verify_secrets():
+    """Check if we have access to Streamlit secrets or env vars."""
+    try:
+        # Check for Streamlit secrets
+        if 'ALPACA_API_KEY' in st.secrets:
+            logger.info("ALPACA_API_KEY found in Streamlit secrets")
+            return True
+        else:
+            logger.warning("ALPACA_API_KEY not found in Streamlit secrets")
+    except Exception as e:
+        logger.warning(f"Error accessing Streamlit secrets: {e}")
+    
+    # Check for environment variables
+    if os.getenv('ALPACA_API_KEY'):
+        logger.info("ALPACA_API_KEY found in environment variables")
+        return True
+    else:
+        logger.warning("ALPACA_API_KEY not found in environment variables")
+        return False
+
 # Configure Streamlit page
 st.set_page_config(
     page_title="CryptoTrading - Advanced Auto-Trading Bot",
@@ -619,6 +640,11 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
+        # Verify API credentials
+        credentials_available = verify_secrets()
+        if not credentials_available:
+            st.error("⚠️ API credentials not found! Make sure ALPACA_API_KEY and ALPACA_API_SECRET are set in Streamlit secrets or environment variables.")
+        
         # Auto-refresh every 15 seconds
         refresh_interval = st.sidebar.slider(
             "Refresh Interval (seconds)", 
@@ -699,6 +725,10 @@ def main():
                 st.metric("Portfolio Value", f"${portfolio_value:.2f}")
                 st.metric("Buying Power", f"${buying_power:.2f}")
                 
+                # Display credentials source if available
+                if hasattr(alpaca_api, 'credentials_source'):
+                    st.info(f"API Source: {alpaca_api.credentials_source}")
+                
                 # Add warning for low buying power
                 if buying_power < 100:
                     st.warning(f"⚠️ Low buying power (${buying_power:.2f}). Buy orders may fail or be reduced in size.")
@@ -723,7 +753,7 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
             except Exception as e:
-                st.error(f"Error loading account info: {str(e)}")
+                st.error(f"Error retrieving account info: {str(e)}")
             
             # Timeframe selection
             timeframe_options = {

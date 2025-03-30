@@ -29,12 +29,49 @@ load_dotenv()
 class AlpacaAPI:
     def __init__(self, config):
         """Initialize Alpaca API client."""
-        self.api_key = os.getenv('ALPACA_API_KEY')
-        self.api_secret = os.getenv('ALPACA_API_SECRET')
+        self.credentials_source = "None"
+        
+        # Try to get credentials from Streamlit secrets if available
+        try:
+            import streamlit as st
+            if 'ALPACA_API_KEY' in st.secrets:
+                self.api_key = st.secrets['ALPACA_API_KEY']
+                self.api_secret = st.secrets['ALPACA_API_SECRET']
+                self.credentials_source = "Streamlit Secrets"
+                print("Using Alpaca credentials from Streamlit secrets")
+            else:
+                # Fall back to environment variables
+                self.api_key = os.getenv('ALPACA_API_KEY')
+                self.api_secret = os.getenv('ALPACA_API_SECRET')
+                self.credentials_source = "Environment Variables"
+                print("Using Alpaca credentials from environment variables")
+        except (ImportError, AttributeError) as e:
+            # If not running in Streamlit or secrets not available
+            print(f"Could not access Streamlit secrets: {str(e)}")
+            self.api_key = os.getenv('ALPACA_API_KEY')
+            self.api_secret = os.getenv('ALPACA_API_SECRET')
+            self.credentials_source = "Environment Variables"
+            print("Using Alpaca credentials from environment variables")
         
         if not self.api_key or not self.api_secret:
-            raise ValueError("Alpaca API credentials not found in environment variables. "
-                           "Please set ALPACA_API_KEY and ALPACA_API_SECRET in your .env file.")
+            error_msg = "Alpaca API credentials not found in environment variables or Streamlit secrets. "
+            error_msg += "Please set ALPACA_API_KEY and ALPACA_API_SECRET in your .env file or Streamlit secrets."
+            
+            # Add diagnostic information
+            try:
+                import streamlit as st
+                if hasattr(st, 'secrets'):
+                    error_msg += f"\nStreamlit secrets available: {list(st.secrets.keys()) if hasattr(st.secrets, 'keys') else 'No'}"
+            except:
+                pass
+                
+            error_msg += f"\nEnvironment variables available: ALPACA_API_KEY={'Yes' if os.getenv('ALPACA_API_KEY') else 'No'}, ALPACA_API_SECRET={'Yes' if os.getenv('ALPACA_API_SECRET') else 'No'}"
+            
+            raise ValueError(error_msg)
+        
+        # Mask keys in log messages for security
+        masked_key = self.api_key[:4] + "..." + self.api_key[-4:] if len(self.api_key) > 8 else "***"
+        print(f"Initializing Alpaca API with key {masked_key} from {self.credentials_source}")
         
         self.trading_client = TradingClient(self.api_key, self.api_secret, paper=True)
         # Initialize crypto data client
