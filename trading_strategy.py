@@ -833,6 +833,9 @@ class TradingStrategy:
                 logger.warning(f"Could not load strategy mode from settings: {str(e)}")
             
             # Decide whether to use market price
+            price = None  # Initialize price variable
+            
+            # Try to get price from various sources
             if signals.get('entry_point'):
                 price = signals.get('entry_point')
             elif signals.get('price'):
@@ -845,11 +848,15 @@ class TradingStrategy:
                     price = self.apis['alpaca'].get_current_price(symbol)
                 else:
                     # Fallback to getting the latest market data
-                    latest_data = self.get_market_data(symbol, '1Min', 1)
-                    price = latest_data['close'].iloc[-1] if not latest_data.empty else None
+                    try:
+                        latest_data = self.get_market_data(symbol, '1Min', 1)
+                        if not latest_data.empty and 'close' in latest_data.columns:
+                            price = latest_data['close'].iloc[-1]
+                    except Exception as e:
+                        logger.warning(f"Failed to get price from market data: {str(e)}")
             
             # Skip the trade if we couldn't determine a price
-            if not price:
+            if price is None:
                 logger.error("Trade execution failed: Could not determine current price")
                 return {
                     "executed": False,
