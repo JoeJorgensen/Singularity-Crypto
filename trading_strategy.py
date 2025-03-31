@@ -911,7 +911,9 @@ class TradingStrategy:
             max_retries = 3
             retry_count = 0
             current_position_size = position_size
-            current_price = price  # Store price for retries
+            
+            # Always initialize current_price to a valid value or 0
+            current_price = price if price is not None else 0
             
             while retry_count < max_retries:
                 try:

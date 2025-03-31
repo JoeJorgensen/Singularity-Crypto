@@ -195,9 +195,11 @@ class OrderManager:
                         position = self.alpaca.get_position(original_symbol)
                         if position and hasattr(position, 'current_price'):
                             price = float(position.current_price)
-                    except:
+                    except Exception as price_error:
                         # Fall back to last known price
-                        pass
+                        logger.debug(f"Could not get current price for {original_symbol}: {str(price_error)}")
+                        # Ensure price has a default value
+                        price = None
                 
                 # If we have a price, calculate estimated order value
                 if price:
@@ -223,198 +225,205 @@ class OrderManager:
                         # Otherwise use adjusted quantity
                         qty = max_qty
                         logger.warning(f"Adjusted quantity to {qty:.6f} to fit buying power")
-        except Exception as e:
-            logger.warning(f"Could not verify account balance before order: {str(e)}")
-        
-        # Validate order type and required parameters
-        if order_type.lower() == 'limit' and limit_price is None:
-            error_msg = "Limit price is required for limit orders"
-            logger.error(error_msg)
-            return {"error": error_msg, "status": "rejected"}
+                else:
+                    # If we couldn't determine a price, proceed with the order but log a warning
+                    logger.warning(f"Could not determine current price for {original_symbol}. Proceeding with order without price validation.")
             
-        if order_type.lower() == 'stop_limit':
-            if stop_price is None:
-                error_msg = "Stop price is required for stop_limit orders"
+            # Validate order type and required parameters
+            if order_type.lower() == 'limit' and limit_price is None:
+                error_msg = "Limit price is required for limit orders"
                 logger.error(error_msg)
                 return {"error": error_msg, "status": "rejected"}
-                
-            if limit_price is None:
-                error_msg = "Limit price is required for stop_limit orders"
-                logger.error(error_msg)
-                return {"error": error_msg, "status": "rejected"}
-        
-        # Log the attempt
-        price_info = ""
-        if limit_price:
-            price_info += f" at limit price {limit_price}"
-        if stop_price:
-            price_info += f" with stop price {stop_price}"
             
-        logger.info(f"Submitting {order_type} {side} order for {qty} {original_symbol}{price_info}")
+            if order_type.lower() == 'stop_limit':
+                if stop_price is None:
+                    error_msg = "Stop price is required for stop_limit orders"
+                    logger.error(error_msg)
+                    return {"error": error_msg, "status": "rejected"}
+                
+                if limit_price is None:
+                    error_msg = "Limit price is required for stop_limit orders"
+                    logger.error(error_msg)
+                    return {"error": error_msg, "status": "rejected"}
         
-        # Set up retry logic for insufficient balance errors
-        max_retries = 3
-        current_qty = qty
-        
-        for attempt in range(max_retries):
-            try:
-                # Submit order
-                order_params = {
-                    'symbol': original_symbol,
-                    'qty': current_qty,
-                    'side': side,
-                    'type': order_type
-                }
-                
-                # Only include optional parameters if they are provided
-                if limit_price is not None:
-                    order_params['limit_price'] = limit_price
-                    
-                if stop_price is not None:
-                    order_params['stop_price'] = stop_price
-                
-                # Submit the order with only the relevant parameters
-                order = self.alpaca.submit_order(**order_params)
-                
-                # Convert order object to dictionary if needed
-                if not isinstance(order, dict):
-                    order_dict = {
-                        'id': order.id if hasattr(order, 'id') else None,
-                        'status': order.status if hasattr(order, 'status') else 'unknown',
-                        'symbol': order.symbol if hasattr(order, 'symbol') else original_symbol,
-                        'side': order.side if hasattr(order, 'side') else side,
-                        'qty': order.qty if hasattr(order, 'qty') else current_qty,
-                        'filled_avg_price': order.filled_avg_price if hasattr(order, 'filled_avg_price') else None
-                    }
-                else:
-                    order_dict = order
-                
-                # Log the result
-                if order_dict.get('status') == 'filled':
-                    logger.info(f"Order {order_dict.get('id')} filled: {side} {current_qty} {original_symbol} at {order_dict.get('filled_avg_price') or 'market price'}")
-                elif order_dict.get('status') == 'accepted' or order_dict.get('status') == 'new':
-                    logger.info(f"Order {order_dict.get('id')} accepted: {side} {current_qty} {original_symbol} (awaiting fill)")
-                else:
-                    logger.info(f"Order {order_dict.get('id')} status: {order_dict.get('status')}")
-                    
-                return order_dict
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                
-                # Check for specific error messages
-                if "stop price cannot be zero" in error_msg or "limit price cannot be zero" in error_msg:
-                    logger.error(f"Order validation failed: {error_msg}")
-                    return {
-                        "error": f"Price validation error: {error_msg}",
-                        "status": "rejected"
+            # Log the attempt
+            price_info = ""
+            if limit_price:
+                price_info += f" at limit price {limit_price}"
+            if stop_price:
+                price_info += f" with stop price {stop_price}"
+            
+            logger.info(f"Submitting {order_type} {side} order for {qty} {original_symbol}{price_info}")
+            
+            # Set up retry logic for insufficient balance errors
+            max_retries = 3
+            current_qty = qty
+            
+            for attempt in range(max_retries):
+                try:
+                    # Submit order
+                    order_params = {
+                        'symbol': original_symbol,
+                        'qty': current_qty,
+                        'side': side,
+                        'type': order_type
                     }
                     
-                # Check for order type validation errors
-                if "unsupported order type" in error_msg:
-                    # For crypto, we can only use market, limit, stop_limit
-                    logger.error(f"Unsupported order type: {order_type}. For crypto, use 'market', 'limit', or 'stop_limit'")
-                    return {
-                        "error": f"Unsupported order type for crypto: {order_type}. Use 'market', 'limit', or 'stop_limit'",
-                        "status": "rejected"
-                    }
+                    # Only include optional parameters if they are provided
+                    if limit_price is not None:
+                        order_params['limit_price'] = limit_price
+                        
+                    if stop_price is not None:
+                        order_params['stop_price'] = stop_price
                     
-                # Check for price validation errors
-                if "stop price must be above" in error_msg or "stop price must be below" in error_msg:
-                    logger.error(f"Stop price validation failed: {error_msg}")
-                    return {
-                        "error": f"Stop price validation error: {error_msg}",
-                        "status": "rejected"
-                    }
-                
-                # Check if this is an insufficient balance error
-                if "insufficient" in error_msg and attempt < max_retries - 1:
-                    # Decrease quantity more aggressively for each retry
-                    # First retry 75%, second retry 50% of original
-                    reduction_factor = 0.75 * (0.67 ** attempt)
-                    current_qty = qty * reduction_factor
+                    # Submit the order with only the relevant parameters
+                    order = self.alpaca.submit_order(**order_params)
                     
-                    # Make sure we're not trying a tiny order
-                    if current_qty < 0.001:
-                        logger.error(f"Cannot reduce quantity further. Order aborted.")
+                    # Convert order object to dictionary if needed
+                    if not isinstance(order, dict):
+                        order_dict = {
+                            'id': order.id if hasattr(order, 'id') else None,
+                            'status': order.status if hasattr(order, 'status') else 'unknown',
+                            'symbol': order.symbol if hasattr(order, 'symbol') else original_symbol,
+                            'side': order.side if hasattr(order, 'side') else side,
+                            'qty': order.qty if hasattr(order, 'qty') else current_qty,
+                            'filled_avg_price': order.filled_avg_price if hasattr(order, 'filled_avg_price') else None
+                        }
+                    else:
+                        order_dict = order
+                    
+                    # Log the result
+                    if order_dict.get('status') == 'filled':
+                        logger.info(f"Order {order_dict.get('id')} filled: {side} {current_qty} {original_symbol} at {order_dict.get('filled_avg_price') or 'market price'}")
+                    elif order_dict.get('status') == 'accepted' or order_dict.get('status') == 'new':
+                        logger.info(f"Order {order_dict.get('id')} accepted: {side} {current_qty} {original_symbol} (awaiting fill)")
+                    else:
+                        logger.info(f"Order {order_dict.get('id')} status: {order_dict.get('status')}")
+                    
+                    return order_dict
+                    
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    
+                    # Check for specific error messages
+                    if "stop price cannot be zero" in error_msg or "limit price cannot be zero" in error_msg:
+                        logger.error(f"Order validation failed: {error_msg}")
                         return {
-                            "error": f"Insufficient balance for minimum order size.",
+                            "error": f"Price validation error: {error_msg}",
                             "status": "rejected"
                         }
                         
-                    logger.warning(f"Insufficient balance error. Retrying with reduced quantity: {current_qty:.6f} {original_symbol} (attempt {attempt+1}/{max_retries})")
-                    continue
-                else:
-                    # Extract helpful information from the error if possible
-                    if "insufficient balance" in error_msg:
-                        # Try to extract available balance from the error message
-                        import re
-                        available_match = re.search(r'available: ([\d.]+)', error_msg)
-                        requested_match = re.search(r'requested: ([\d.]+)', error_msg)
+                    # Check for order type validation errors
+                    if "unsupported order type" in error_msg:
+                        # For crypto, we can only use market, limit, stop_limit
+                        logger.error(f"Unsupported order type: {order_type}. For crypto, use 'market', 'limit', or 'stop_limit'")
+                        return {
+                            "error": f"Unsupported order type for crypto: {order_type}. Use 'market', 'limit', or 'stop_limit'",
+                            "status": "rejected"
+                        }
                         
-                        if available_match and requested_match:
-                            available = float(available_match.group(1))
-                            requested = float(requested_match.group(1))
-                            
-                            # Calculate a safe quantity and try one more time
-                            if price and attempt < max_retries - 1:
-                                safe_qty = (available * 0.95) / price  # Use 95% of available
-                                if safe_qty > 0.001 and safe_qty * price >= 5:
-                                    current_qty = safe_qty
-                                    logger.warning(f"Attempting one more time with quantity based on exact available balance: {current_qty:.6f}")
-                                    continue
-                            
-                            logger.error(f"Order failed: requested ${requested:.2f} but only ${available:.2f} available")
+                    # Check for price validation errors
+                    if "stop price must be above" in error_msg or "stop price must be below" in error_msg:
+                        logger.error(f"Stop price validation failed: {error_msg}")
+                        return {
+                            "error": f"Stop price validation error: {error_msg}",
+                            "status": "rejected"
+                        }
+                    
+                    # Check if this is an insufficient balance error
+                    if "insufficient" in error_msg and attempt < max_retries - 1:
+                        # Decrease quantity more aggressively for each retry
+                        # First retry 75%, second retry 50% of original
+                        reduction_factor = 0.75 * (0.67 ** attempt)
+                        current_qty = qty * reduction_factor
+                        
+                        # Make sure we're not trying a tiny order
+                        if current_qty < 0.001:
+                            logger.error(f"Cannot reduce quantity further. Order aborted.")
                             return {
-                                "error": f"Insufficient balance: ${available:.2f} available, ${requested:.2f} required.",
+                                "error": f"Insufficient balance for minimum order size.",
                                 "status": "rejected"
                             }
-                    
-                    # Log and return error for other errors or if we've exhausted retries
-                    logger.error(f"Order execution failed for {side} {current_qty} {original_symbol}: {str(e)}", exc_info=True)
-                    
-                    # Special handling for price determination errors
-                    if "could not determine current price" in error_msg.lower():
-                        # If this is a market order, try again with a direct market order, bypassing buying power check
-                        if order_type.lower() == 'market' and attempt < max_retries - 1:
-                            logger.warning("Price data unavailable. Retrying market order with direct API approach...")
-                            try:
-                                # Try to execute a direct market order without the buying power check
-                                trading_symbol = original_symbol.replace('/', '')
+                            
+                        logger.warning(f"Insufficient balance error. Retrying with reduced quantity: {current_qty:.6f} {original_symbol} (attempt {attempt+1}/{max_retries})")
+                        continue
+                    else:
+                        # Extract helpful information from the error if possible
+                        if "insufficient balance" in error_msg:
+                            # Try to extract available balance from the error message
+                            import re
+                            available_match = re.search(r'available: ([\d.]+)', error_msg)
+                            requested_match = re.search(r'requested: ([\d.]+)', error_msg)
+                            
+                            if available_match and requested_match:
+                                available = float(available_match.group(1))
+                                requested = float(requested_match.group(1))
                                 
-                                # Use direct API call to Alpaca
-                                base_url = "https://paper-api.alpaca.markets/v2/orders"
-                                headers = {
-                                    "APCA-API-KEY-ID": self.alpaca.api_key,
-                                    "APCA-API-SECRET-KEY": self.alpaca.api_secret,
-                                    "Content-Type": "application/json"
+                                # Check if price is defined and valid before attempting to use it
+                                if 'price' in locals() and price is not None and attempt < max_retries - 1:
+                                    safe_qty = (available * 0.95) / price  # Use 95% of available
+                                    if safe_qty > 0.001 and safe_qty * price >= 5:
+                                        current_qty = safe_qty
+                                        logger.warning(f"Attempting one more time with quantity based on exact available balance: {current_qty:.6f}")
+                                        continue
+                                
+                                logger.error(f"Order failed: requested ${requested:.2f} but only ${available:.2f} available")
+                                return {
+                                    "error": f"Insufficient balance: ${available:.2f} available, ${requested:.2f} required.",
+                                    "status": "rejected"
                                 }
-                                
-                                # Build basic market order
-                                order_data = {
-                                    "symbol": trading_symbol,
-                                    "qty": str(current_qty),
-                                    "side": side.lower(),
-                                    "type": "market",
-                                    "time_in_force": "gtc"
-                                }
-                                
-                                import requests
-                                response = requests.post(base_url, headers=headers, json=order_data)
-                                
-                                if response.status_code == 200:
-                                    order_dict = response.json()
-                                    logger.info(f"Direct market order successful: {order_dict.get('id')}")
-                                    return order_dict
-                                else:
-                                    logger.error(f"Direct market order failed: {response.text}")
-                            except Exception as direct_error:
-                                logger.error(f"Direct market order failed: {str(direct_error)}")
-                    
-                    return {
-                        "error": str(e),
-                        "status": "rejected" 
-                    }
+                        
+                        # Log and return error for other errors or if we've exhausted retries
+                        logger.error(f"Order execution failed for {side} {current_qty} {original_symbol}: {str(e)}", exc_info=True)
+                        
+                        # Special handling for price determination errors
+                        if "could not determine current price" in error_msg.lower():
+                            # If this is a market order, try again with a direct market order, bypassing buying power check
+                            if order_type.lower() == 'market' and attempt < max_retries - 1:
+                                logger.warning("Price data unavailable. Retrying market order with direct API approach...")
+                                try:
+                                    # Try to execute a direct market order without the buying power check
+                                    trading_symbol = original_symbol.replace('/', '')
+                                    
+                                    # Use direct API call to Alpaca
+                                    base_url = "https://paper-api.alpaca.markets/v2/orders"
+                                    headers = {
+                                        "APCA-API-KEY-ID": self.alpaca.api_key,
+                                        "APCA-API-SECRET-KEY": self.alpaca.api_secret,
+                                        "Content-Type": "application/json"
+                                    }
+                                    
+                                    # Build basic market order
+                                    order_data = {
+                                        "symbol": trading_symbol,
+                                        "qty": str(current_qty),
+                                        "side": side.lower(),
+                                        "type": "market",
+                                        "time_in_force": "gtc"
+                                    }
+                                    
+                                    import requests
+                                    response = requests.post(base_url, headers=headers, json=order_data)
+                                    
+                                    if response.status_code == 200:
+                                        order_dict = response.json()
+                                        logger.info(f"Direct market order successful: {order_dict.get('id')}")
+                                        return order_dict
+                                    else:
+                                        logger.error(f"Direct market order failed: {response.text}")
+                                except Exception as direct_error:
+                                    logger.error(f"Direct market order failed: {str(direct_error)}")
+                        
+                        return {
+                            "error": str(e),
+                            "status": "rejected" 
+                        }
+        except Exception as e:
+            logger.warning(f"Could not verify account balance before order: {str(e)}")
+            return {
+                "error": f"Failed to verify account balance before order: {str(e)}",
+                "status": "rejected"
+            }
     
     def execute_trade_with_risk_management(
         self,
