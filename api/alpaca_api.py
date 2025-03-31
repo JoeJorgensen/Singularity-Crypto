@@ -27,7 +27,8 @@ from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.live import CryptoDataStream
-from alpaca.data.enums import CryptoFeed
+# Don't import CryptoFeed enum since it causes issues in Streamlit cloud
+# from alpaca.data.enums import CryptoFeed 
 from alpaca.data.models import Bar, Trade, Quote
 
 # Load environment variables
@@ -413,48 +414,97 @@ class AlpacaAPI:
         """
         try:
             # Parse the timeframe
-            tf = self._parse_timeframe(timeframe)
+            if timeframe.endswith('Min'):
+                tf_str = f"{timeframe[:-3]}Min"
+                multiplier = int(timeframe[:-3])
+                seconds_per_unit = 60
+            elif timeframe.endswith('H'):
+                tf_str = f"{timeframe[:-1]}Hour"
+                multiplier = int(timeframe[:-1])
+                seconds_per_unit = 3600
+            else:  # Day
+                tf_str = "1Day"
+                multiplier = 1
+                seconds_per_unit = 86400
             
-            # Create request parameters
-            request_params = CryptoBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                limit=limit
-            )
+            # Calculate start time based on limit and timeframe
+            end = datetime.now()
+            start = end - timedelta(seconds=multiplier * seconds_per_unit * limit)
             
-            # Get the bars
-            bars_response = self.data_client.get_crypto_bars(request_params)
+            # Format timestamps for API request
+            start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
+            end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
             
-            # Check if we have data
-            if not hasattr(bars_response, 'data') or symbol not in bars_response.data:
+            # Create direct API request
+            url = f"https://data.alpaca.markets/v1beta3/crypto/us/bars"
+            headers = {
+                "APCA-API-KEY-ID": self.api_key,
+                "APCA-API-SECRET-KEY": self.api_secret
+            }
+            params = {
+                "symbols": symbol,
+                "timeframe": tf_str,
+                "start": start_str,
+                "end": end_str,
+                "limit": limit
+                # Note: The crypto/us endpoint automatically uses IEX feed
+            }
+            
+            # Make the API request directly
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                self.logger.error(f"Error getting crypto bars: {response.text}")
+                return pd.DataFrame()
+            
+            bars_data = response.json()
+            
+            if not bars_data or 'bars' not in bars_data or not bars_data['bars'] or symbol not in bars_data['bars']:
                 self.logger.error(f"No data found for symbol {symbol}")
                 return pd.DataFrame()
             
-            # Get the bars for the symbol
-            bars = bars_response.data[symbol]
+            # Convert to DataFrame
+            bars_list = bars_data['bars'][symbol]
+            df = pd.DataFrame(bars_list)
             
-            # Convert bars to a dict for DataFrame creation
-            data_list = []
-            for bar in bars:
-                bar_dict = {
-                    'timestamp': bar.timestamp,
-                    'open': bar.open,
-                    'high': bar.high,
-                    'low': bar.low,
-                    'close': bar.close,
-                    'volume': bar.volume,
-                    'trade_count': bar.trade_count,
-                    'vwap': bar.vwap,
-                    'symbol': bar.symbol
-                }
-                data_list.append(bar_dict)
+            if df.empty:
+                self.logger.error(f"Empty dataframe received from Alpaca API")
+                return pd.DataFrame()
             
-            # Create DataFrame
-            df = pd.DataFrame(data_list)
+            # Rename columns to match the SDK's format
+            column_mapping = {
+                't': 'timestamp',
+                'o': 'open',
+                'h': 'high',
+                'l': 'low',
+                'c': 'close',
+                'v': 'volume',
+                'n': 'trade_count',
+                'vw': 'vwap'
+            }
             
-            # Set timestamp as index
+            for orig_col, new_col in column_mapping.items():
+                if orig_col in df.columns:
+                    df[new_col] = df[orig_col]
+                    df.drop(orig_col, axis=1, inplace=True)
+            
+            # Convert timestamp to datetime
             if 'timestamp' in df.columns:
-                df = df.set_index('timestamp')
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df.set_index('timestamp', inplace=True)
+            
+            # Ensure all required columns exist
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            for col in required_columns:
+                if col not in df.columns:
+                    if col == 'volume':
+                        # Use a small default volume value to prevent division by zero errors
+                        df[col] = 1.0
+                    elif col in ['open', 'high', 'low']:
+                        # Use close price if available, otherwise 0
+                        df[col] = df['close'] if 'close' in df.columns else 0.0
+                    else:
+                        df[col] = 0.0
             
             return df
             
@@ -467,43 +517,57 @@ class AlpacaAPI:
                     time.sleep(2 ** i)
                     self.logger.info(f"Retrying get_crypto_bars (attempt {i+1})...")
                     
-                    # Try again with the same parameters
-                    bars_response = self.data_client.get_crypto_bars(request_params)
+                    # Make the API request directly
+                    response = requests.get(url, headers=headers, params=params, timeout=10)
                     
-                    # Check if we have data
-                    if hasattr(bars_response, 'data') and symbol in bars_response.data:
-                        # Get the bars for the symbol
-                        bars = bars_response.data[symbol]
-                        
-                        # Convert bars to a dict for DataFrame creation
-                        data_list = []
-                        for bar in bars:
-                            bar_dict = {
-                                'timestamp': bar.timestamp,
-                                'open': bar.open,
-                                'high': bar.high,
-                                'low': bar.low,
-                                'close': bar.close,
-                                'volume': bar.volume,
-                                'trade_count': bar.trade_count,
-                                'vwap': bar.vwap,
-                                'symbol': bar.symbol
-                            }
-                            data_list.append(bar_dict)
-                        
-                        # Create DataFrame
-                        df = pd.DataFrame(data_list)
-                        
-                        # Set timestamp as index
-                        if 'timestamp' in df.columns:
-                            df = df.set_index('timestamp')
-                        
-                        return df
+                    if response.status_code != 200:
+                        self.logger.error(f"Retry {i+1} failed: {response.text}")
+                        continue
+                    
+                    bars_data = response.json()
+                    
+                    if not bars_data or 'bars' not in bars_data or not bars_data['bars'] or symbol not in bars_data['bars']:
+                        self.logger.error(f"No data found for symbol {symbol} in retry {i+1}")
+                        continue
+                    
+                    # Convert to DataFrame
+                    bars_list = bars_data['bars'][symbol]
+                    df = pd.DataFrame(bars_list)
+                    
+                    if df.empty:
+                        self.logger.error(f"Empty dataframe received from Alpaca API in retry {i+1}")
+                        continue
+                    
+                    # Rename columns to match the SDK's format
+                    for orig_col, new_col in column_mapping.items():
+                        if orig_col in df.columns:
+                            df[new_col] = df[orig_col]
+                            df.drop(orig_col, axis=1, inplace=True)
+                    
+                    # Convert timestamp to datetime
+                    if 'timestamp' in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        df.set_index('timestamp', inplace=True)
+                    
+                    # Ensure all required columns exist
+                    for col in required_columns:
+                        if col not in df.columns:
+                            if col == 'volume':
+                                # Use a small default volume value to prevent division by zero errors
+                                df[col] = 1.0
+                            elif col in ['open', 'high', 'low']:
+                                # Use close price if available, otherwise 0
+                                df[col] = df['close'] if 'close' in df.columns else 0.0
+                            else:
+                                df[col] = 0.0
+                    
+                    return df
                 
                 except Exception as retry_e:
                     self.logger.error(f"Retry {i+1} failed: {str(retry_e)}")
             
             # If we get here, all retries failed
+            self.logger.warning(f"No price data available for {symbol}")
             return pd.DataFrame()
     
     # Websocket methods for real-time market data
@@ -521,7 +585,7 @@ class AlpacaAPI:
             self._ws_client = CryptoDataStream(
                 api_key=self.api_key,
                 secret_key=self.api_secret,
-                feed="us"  # Use string "us" instead of CryptoFeed.US as required by Alpaca API
+                feed="us"  # Use string value to avoid CryptoFeed.US compatibility issues
             )
             
             # Set connected flag
@@ -678,7 +742,7 @@ class AlpacaAPI:
             self._ws_client = CryptoDataStream(
                 api_key=self.api_key,
                 secret_key=self.api_secret,
-                feed="us"  # Use string "us" instead of CryptoFeed.US as required by Alpaca API
+                feed="us"  # Use string value to avoid CryptoFeed.US compatibility issues
             )
             
             # Configure authentication parameters to be more aggressive
@@ -1483,7 +1547,14 @@ class AlpacaAPI:
         return self.get_crypto_bars(symbol, timeframe, limit)
 
     def _parse_timeframe(self, timeframe: str):
-        """Parse timeframe string into Alpaca TimeFrame object."""
+        """Parse timeframe string into a format suitable for Alpaca API requests.
+        
+        Args:
+            timeframe: String timeframe like '1Min', '5Min', '1H', etc.
+            
+        Returns:
+            String for direct API usage
+        """
         # Remove any spaces
         tf = timeframe.replace(' ', '')
         
@@ -1491,59 +1562,27 @@ class AlpacaAPI:
             # Handle minute timeframes
             if tf.endswith('Min'):
                 minutes = int(tf[:-3])
-                if minutes == 1:
-                    return TimeFrame.Minute  # Use the class property for 1 minute
-                else:
-                    # Use constructor if available, otherwise use class attributes
-                    try:
-                        return TimeFrame(minutes, TimeFrameUnit.Minute)
-                    except (TypeError, AttributeError):
-                        # Fall back for older versions of the SDK
-                        if hasattr(TimeFrame, f"{minutes}Min"):
-                            return getattr(TimeFrame, f"{minutes}Min")
-                        else:
-                            print(f"Warning: Could not create {minutes}Min timeframe, using 1Min")
-                            return TimeFrame.Minute
+                return f"{minutes}Min"
                 
             # Handle hour timeframes
             elif tf.endswith('H'):
                 hours = int(tf[:-1])
-                if hours == 1:
-                    return TimeFrame.Hour  # Use the class property for 1 hour
-                else:
-                    # Use constructor if available, otherwise use class attributes
-                    try:
-                        return TimeFrame(hours, TimeFrameUnit.Hour)
-                    except (TypeError, AttributeError):
-                        # Fall back for older versions of the SDK
-                        if hasattr(TimeFrame, f"{hours}Hour"):
-                            return getattr(TimeFrame, f"{hours}Hour")
-                        else:
-                            print(f"Warning: Could not create {hours}Hour timeframe, using 1Hour")
-                            return TimeFrame.Hour
+                return f"{hours}Hour"
                 
             # Handle day timeframes
             elif tf.endswith('D'):
                 days = int(tf[:-1]) if len(tf) > 1 else 1
-                if days == 1:
-                    return TimeFrame.Day  # Use the class property for 1 day
-                else:
-                    # Days other than 1 might not be supported in some SDK versions
-                    try:
-                        return TimeFrame(days, TimeFrameUnit.Day)
-                    except (TypeError, AttributeError):
-                        print(f"Warning: Could not create {days}Day timeframe, using 1Day")
-                        return TimeFrame.Day
+                return f"{days}Day"
                 
             # Default to 1 Hour if unrecognized
             else:
-                print(f"Warning: Unrecognized timeframe format '{timeframe}', defaulting to 1 Hour")
-                return TimeFrame.Hour
+                self.logger.warning(f"Unrecognized timeframe format '{timeframe}', defaulting to 1Hour")
+                return "1Hour"
                 
         except Exception as e:
             # Catch any unexpected errors and provide a safe default
-            print(f"Error parsing timeframe '{timeframe}': {e}. Using default 1 Hour")
-            return TimeFrame.Hour
+            self.logger.error(f"Error parsing timeframe '{timeframe}': {e}. Using default 1Hour")
+            return "1Hour"
 
     async def _stop_websocket_async(self):
         """Async helper to stop the websocket connection."""
