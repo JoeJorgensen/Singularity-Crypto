@@ -28,7 +28,7 @@ def main():
     # Create a simple API instance with default config
     config = {
         'data_optimization': {'cache_ttl': 60},
-        'trading': {'supported_pairs': ['ETH/USD', 'BTC/USD']}
+        'trading': {'supported_pairs': ['ETH/USD']}
     }
     api = AlpacaAPI(config)
     logger.info("Created AlpacaAPI instance")

@@ -132,7 +132,7 @@ class TradingStrategy:
                 # List of symbols to monitor
                 symbols_to_monitor = self.config.get('trading', {}).get(
                     'supported_pairs', 
-                    ['ETH/USD', 'BTC/USD', 'LTC/USD', 'BCH/USD', 'XRP/USD']
+                    ['ETH/USD']
                 )
                 
                 # Define background function for starting websocket
@@ -159,6 +159,14 @@ class TradingStrategy:
                 ws_thread = threading.Thread(target=start_ws_in_background, daemon=True)
                 ws_thread.start()
                 self.logger.info("Websocket initialization triggered in background thread")
+                
+                # Start the price cache updater to maintain price data even during API disruptions
+                try:
+                    self.logger.info(f"Starting price cache updater for {symbols_to_monitor}")
+                    alpaca_api.start_price_cache_updater(symbols=symbols_to_monitor)
+                    self.logger.info("Price cache updater started successfully")
+                except Exception as e:
+                    self.logger.warning(f"Error starting price cache updater: {str(e)}")
             else:
                 self.logger.info("Websocket initialization already attempted, skipping redundant initialization")
         except Exception as e:
@@ -1784,7 +1792,7 @@ class TradingStrategy:
             # Get all crypto pairs we might trade
             supported_pairs = self.config.get('trading', {}).get(
                 'supported_pairs', 
-                ['ETH/USD', 'BTC/USD', 'LTC/USD', 'BCH/USD', 'XRP/USD']
+                ['ETH/USD']
             )
             
             # Make sure default pair is included
@@ -1812,5 +1820,10 @@ class TradingStrategy:
             if hasattr(self.apis['alpaca'], 'stop_websocket'):
                 self.logger.info("Stopping websocket connection")
                 self.apis['alpaca'].stop_websocket()
+                
+            # Stop the price cache updater if it exists
+            if hasattr(self.apis['alpaca'], 'stop_price_cache_updater'):
+                self.logger.info("Stopping price cache updater")
+                self.apis['alpaca'].stop_price_cache_updater()
         except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}") 
+            self.logger.error(f"Error during cleanup: {e}")

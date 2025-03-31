@@ -943,13 +943,8 @@ def main():
         trading_details_container = st.container()
         
         with header_container:
-            # Title and description
-            st.title("CryptoTrading - Advanced Auto-Trading System")
-            st.markdown("""
-            Real-time automated cryptocurrency trading with advanced signal processing and risk management.
-            This system continuously monitors the market and executes trades based on technical analysis, 
-            sentiment signals and custom parameters.
-            """)
+            # Title and description removed for cleaner UI
+            pass
         
         # Verify API credentials
         credentials_available = verify_secrets()
@@ -1981,15 +1976,15 @@ def main():
                     # Ensure max_value is at least equal to min_value and safely handle position
                     position_qty = safe_position_value(position, 'qty')
                     max_amount = max(
-                        0.001,  # minimum amount
+                        5.0,  # minimum amount
                         float(max_eth if side == "Buy" else position_qty)
                     )
                     
                     amount = st.number_input(
                         "Amount (ETH)",
-                        min_value=0.001,
+                        min_value=5.0,
                         max_value=max_amount,
-                        value=min(0.001, max_amount),  # Ensure default value doesn't exceed max
+                        value=min(5.0, max_amount),  # Ensure default value doesn't exceed max
                         step=0.001,
                         format="%.3f"
                     )

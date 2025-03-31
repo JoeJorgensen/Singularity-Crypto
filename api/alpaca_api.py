@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from functools import lru_cache
 import websockets
 from alpaca.data.timeframe import TimeFrameUnit
+import numpy as np
 
 
 # Alpaca-py imports
@@ -126,12 +127,8 @@ class AlpacaAPI:
         # Cache for historical data requests
         self.cache_timestamp = time.time()
         
-        # Load environment variables for paper trading
-        # self.test_mode = os.getenv('TEST_MODE', 'False').lower() == 'true'
-        # self.logger.info(f"Test mode: {self.test_mode}")
-        
         # Fix for handling timezone-aware datetimes in pandas
-        pd.set_option('use_inf_as_na', True)
+        # Removed deprecated use_inf_as_na option
         
         # Dictionary to track orders placed
         self.open_orders = {}
@@ -197,7 +194,14 @@ class AlpacaAPI:
         
         # Cache settings
         self.cache_ttl = self.config.get('data_optimization', {}).get('cache_ttl', 60)  # seconds
-    
+        
+        # Cache for last known valid prices
+        self.last_known_prices = {}
+        self.last_price_update_time = {}
+        self.price_cache_updater_running = False
+        self.price_cache_updater_thread = None
+        self.price_update_interval = 15  # seconds
+        
     # Use LRU cache for account info (refreshes every minute)
     @lru_cache(maxsize=1)
     def _get_account_cached(self, timestamp):
@@ -350,7 +354,7 @@ class AlpacaAPI:
                         else:
                             print("Warning: Volume data still missing after processing.")
                         
-                        return df
+                        return self._replace_inf_with_nan(df)
                         
             except aiohttp.ClientError as e:
                 print(f"Network error fetching crypto bars: {str(e)}")
@@ -373,13 +377,13 @@ class AlpacaAPI:
             ws_data = self.get_latest_websocket_data(symbol)
             if ws_data is not None and ws_data['close'] is not None:
                 # Use the data from our polling method
-                return pd.DataFrame({
+                return self._replace_inf_with_nan(pd.DataFrame({
                     'open': [ws_data['open']],
                     'high': [ws_data['high']],
                     'low': [ws_data['low']],
                     'close': [ws_data['close']],
                     'volume': [ws_data['volume'] if ws_data['volume'] > 0 else 1.0]
-                }, index=[ws_data['timestamp'] if ws_data['timestamp'] else pd.Timestamp.now()])
+                }, index=[ws_data['timestamp'] if ws_data['timestamp'] else pd.Timestamp.now()]))
         except Exception as e:
             print(f"Failed to use polling data as fallback: {e}")
         
@@ -412,6 +416,11 @@ class AlpacaAPI:
         Returns:
             DataFrame with the bars
         """
+        # Skip known unsupported symbols to avoid unnecessary API calls and errors
+        if symbol in ['LTC/USD', 'BCH/USD', 'XRP/USD']:
+            self.logger.debug(f"Skipping known unsupported symbol: {symbol}")
+            return pd.DataFrame()
+            
         try:
             # Parse the timeframe
             if timeframe.endswith('Min'):
@@ -506,7 +515,7 @@ class AlpacaAPI:
                     else:
                         df[col] = 0.0
             
-            return df
+            return self._replace_inf_with_nan(df)
             
         except Exception as e:
             self.logger.error(f"Error getting crypto bars: {str(e)}")
@@ -561,13 +570,14 @@ class AlpacaAPI:
                             else:
                                 df[col] = 0.0
                     
-                    return df
+                    return self._replace_inf_with_nan(df)
                 
                 except Exception as retry_e:
-                    self.logger.error(f"Retry {i+1} failed: {str(retry_e)}")
+                    self.logger.error(f"Error in retry {i+1}: {str(retry_e)}")
+                    continue
             
-            # If we get here, all retries failed
-            self.logger.warning(f"No price data available for {symbol}")
+            # If all retries fail, return empty DataFrame
+            self.logger.warning(f"No data available for {symbol}")
             return pd.DataFrame()
     
     # Websocket methods for real-time market data
@@ -703,7 +713,7 @@ class AlpacaAPI:
         """
         # Default symbols if not provided
         if not symbols:
-            symbols = ['ETH/USD', 'BTC/USD']  # Default symbols
+            symbols = ['ETH/USD']  # Default to only ETH/USD
         
         # Check if we're in a cooldown period
         current_time = datetime.now()
@@ -977,12 +987,33 @@ class AlpacaAPI:
             if not bars.empty:
                 current_price = bars['close'].iloc[-1]
                 self.logger.info(f"Current price for {symbol}: ${current_price}")
+                
+                # Update the price cache
+                self.last_known_prices[symbol] = current_price
+                self.last_price_update_time[symbol] = datetime.now()
+                
                 return current_price
             else:
                 self.logger.warning(f"No price data available for {symbol}")
+                
+                # Check if we have a cached price
+                if symbol in self.last_known_prices:
+                    cached_price = self.last_known_prices[symbol]
+                    cache_age = (datetime.now() - self.last_price_update_time[symbol]).total_seconds()
+                    self.logger.warning(f"Using cached price for {symbol}: ${cached_price} (age: {cache_age:.1f}s)")
+                    return cached_price
+                    
                 return None
         except Exception as e:
             self.logger.error(f"Error getting current price for {symbol}: {e}")
+            
+            # Check if we have a cached price
+            if symbol in self.last_known_prices:
+                cached_price = self.last_known_prices[symbol]
+                cache_age = (datetime.now() - self.last_price_update_time[symbol]).total_seconds()
+                self.logger.warning(f"Using cached price after error for {symbol}: ${cached_price} (age: {cache_age:.1f}s)")
+                return cached_price
+                
             return None
     
     def get_position(self, symbol='ETH/USD'):
@@ -1039,26 +1070,71 @@ class AlpacaAPI:
                 else:
                     # For market orders, we need to fetch the current price
                     current_price = self.get_current_price(symbol)  # Use symbol with slash
-                    if not current_price:
-                        # Fall back to recent bars
-                        bars = self.get_crypto_bars(symbol, '1Min', 1)  # Use symbol with slash
-                        if not bars.empty:
-                            current_price = bars['close'].iloc[-1]
-                        else:
-                            raise ValueError("Could not determine current price for order value calculation")
                     
-                    order_value = qty * current_price
-                
-                # Add a safety margin for market price fluctuations (10%)
-                if type.lower() == 'market':
-                    order_value *= 1.1
-                
-                # Check if we have sufficient buying power
-                if order_value > buying_power:
-                    raise ValueError(
-                        f"Insufficient buying power for order: ${order_value:.2f} required, but only ${buying_power:.2f} available. "
-                        f"Reduce quantity to approximately {(buying_power / order_value * qty * 0.9):.6f} or less."
-                    )
+                    # If current price is not available, try alternative approaches
+                    if not current_price:
+                        self.logger.warning(f"Could not determine current price for {symbol}, trying alternative methods")
+                        
+                        # Try to get recent bars with longer timeframe
+                        try:
+                            # Try using larger timeframes
+                            for tf in ['5Min', '15Min', '1H']:
+                                bars = self.get_crypto_bars(symbol, tf, 1)
+                                if not bars.empty:
+                                    current_price = bars['close'].iloc[-1]
+                                    self.logger.info(f"Using {tf} timeframe price for {symbol}: ${current_price}")
+                                    
+                                    # Update the price cache
+                                    self.last_known_prices[symbol] = current_price
+                                    self.last_price_update_time[symbol] = datetime.now()
+                                    
+                                    break
+                        except Exception as e:
+                            self.logger.error(f"Error getting alternative timeframe price: {e}")
+                            
+                        # If still no price, try websocket data
+                        if not current_price:
+                            try:
+                                ws_data = self.get_latest_websocket_data(symbol)
+                                if ws_data and ws_data['close'] is not None:
+                                    current_price = ws_data['close']
+                                    self.logger.info(f"Using websocket price for {symbol}: ${current_price}")
+                                    
+                                    # Update the price cache
+                                    self.last_known_prices[symbol] = current_price
+                                    self.last_price_update_time[symbol] = datetime.now()
+                            except Exception as e:
+                                self.logger.error(f"Error getting websocket price: {e}")
+                        
+                        # If still no price, check if we have a cached price
+                        if not current_price and symbol in self.last_known_prices:
+                            current_price = self.last_known_prices[symbol]
+                            cache_age = (datetime.now() - self.last_price_update_time[symbol]).total_seconds()
+                            
+                            # Only use cached price if it's reasonably recent (less than 1 hour old)
+                            if cache_age < 3600:  # 1 hour in seconds
+                                self.logger.warning(f"Using cached price from {cache_age:.1f}s ago: ${current_price}")
+                            else:
+                                # Cache is too old, don't use it
+                                self.logger.warning(f"Cached price is too old ({cache_age:.1f}s), skipping buying power check")
+                                current_price = None
+                    
+                    # At this point, if we still don't have a price, skip the buying power check
+                    if current_price:
+                        order_value = qty * current_price
+                        
+                        # Add a safety margin for market price fluctuations (10%)
+                        if type.lower() == 'market':
+                            order_value *= 1.1
+                        
+                        # Check if we have sufficient buying power
+                        if order_value > buying_power:
+                            raise ValueError(
+                                f"Insufficient buying power for order: ${order_value:.2f} required, but only ${buying_power:.2f} available. "
+                                f"Reduce quantity to approximately {(buying_power / order_value * qty * 0.9):.6f} or less."
+                            )
+                    else:
+                        self.logger.warning("Skipping buying power check due to unavailable price data")
             
             # Prepare order parameters
             order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
@@ -1070,13 +1146,17 @@ class AlpacaAPI:
             
             # Build the appropriate order based on type
             if order_type == 'market':
-                # Market order
+                # Market order - we don't need the price for a market order
+                # Just create the order
                 order_data = MarketOrderRequest(
                     symbol=trading_symbol,
                     qty=qty,
                     side=order_side,
                     time_in_force=TimeInForce.GTC
                 )
+                
+                # Log the order details
+                self.logger.info(f"Submitting market {side} order for {qty} {trading_symbol}")
             elif order_type == 'limit':
                 # Ensure limit_price is provided for limit orders
                 if limit_price is None:
@@ -1672,3 +1752,96 @@ class AlpacaAPI:
         except Exception as e:
             self.logger.error(f"Error stopping websocket: {str(e)}")
             return False
+
+    def start_price_cache_updater(self, symbols=None):
+        """
+        Start a background thread to periodically update the price cache for specified symbols.
+        
+        Args:
+            symbols: List of symbols to cache prices for (default: ETH/USD only)
+            
+        Returns:
+            bool: True if started, False if already running
+        """
+        if self.price_cache_updater_running:
+            self.logger.info("Price cache updater already running")
+            return False
+            
+        # Default to only ETH/USD if not provided
+        if not symbols:
+            symbols = ['ETH/USD']
+            
+        self.logger.info(f"Starting price cache updater for symbols: {symbols}")
+        
+        def update_price_cache():
+            self.price_cache_updater_running = True
+            while self.price_cache_updater_running:
+                try:
+                    # Update price for each symbol
+                    for symbol in symbols:
+                        try:
+                            # Try different timeframes if 1Min fails
+                            price = None
+                            for timeframe in ['1Min', '5Min', '15Min', '1H']:
+                                try:
+                                    bars = self.get_crypto_bars(symbol, timeframe, 1)
+                                    if not bars.empty:
+                                        price = bars['close'].iloc[-1]
+                                        # Update the price cache
+                                        self.last_known_prices[symbol] = price
+                                        self.last_price_update_time[symbol] = datetime.now()
+                                        self.logger.debug(f"Updated price cache for {symbol}: ${price} using {timeframe} timeframe")
+                                        break
+                                except Exception as tf_error:
+                                    continue
+                                    
+                            # Also try websocket data if available
+                            if price is None:
+                                try:
+                                    ws_data = self.get_latest_websocket_data(symbol)
+                                    if ws_data and ws_data['close'] is not None:
+                                        price = ws_data['close']
+                                        # Update the price cache
+                                        self.last_known_prices[symbol] = price
+                                        self.last_price_update_time[symbol] = datetime.now()
+                                        self.logger.debug(f"Updated price cache for {symbol}: ${price} from websocket")
+                                except Exception:
+                                    pass
+                                    
+                        except Exception as symbol_error:
+                            self.logger.warning(f"Error updating price cache for {symbol}: {symbol_error}")
+                    
+                    # Sleep before next update
+                    time.sleep(self.price_update_interval)
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in price cache updater: {e}")
+                    time.sleep(5)  # Wait a bit before retrying
+                    
+        # Start the thread
+        self.price_cache_updater_thread = threading.Thread(
+            target=update_price_cache,
+            daemon=True
+        )
+        self.price_cache_updater_thread.start()
+        return True
+    
+    def stop_price_cache_updater(self):
+        """Stop the price cache updater thread."""
+        if self.price_cache_updater_running:
+            self.logger.info("Stopping price cache updater")
+            self.price_cache_updater_running = False
+            if self.price_cache_updater_thread:
+                # Wait for thread to finish
+                self.price_cache_updater_thread.join(timeout=2.0)
+            return True
+        else:
+            self.logger.info("Price cache updater not running")
+            return False
+
+    @staticmethod
+    def _replace_inf_with_nan(df):
+        """Replace inf values with NaN in a DataFrame."""
+        if df is not None and not df.empty:
+            return df.replace([np.inf, -np.inf], np.nan)
+        return df

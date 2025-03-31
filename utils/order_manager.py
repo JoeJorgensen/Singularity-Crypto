@@ -59,7 +59,7 @@ class OrderManager:
         """
         try:
             # Get list of supported pairs from config
-            supported_pairs = self.config.get('trading', {}).get('supported_pairs', ['ETH/USD', 'BTC/USD'])
+            supported_pairs = self.config.get('trading', {}).get('supported_pairs', ['ETH/USD'])
             
             positions = []
             # Try to get position for each supported pair
@@ -372,6 +372,45 @@ class OrderManager:
                     
                     # Log and return error for other errors or if we've exhausted retries
                     logger.error(f"Order execution failed for {side} {current_qty} {original_symbol}: {str(e)}", exc_info=True)
+                    
+                    # Special handling for price determination errors
+                    if "could not determine current price" in error_msg.lower():
+                        # If this is a market order, try again with a direct market order, bypassing buying power check
+                        if order_type.lower() == 'market' and attempt < max_retries - 1:
+                            logger.warning("Price data unavailable. Retrying market order with direct API approach...")
+                            try:
+                                # Try to execute a direct market order without the buying power check
+                                trading_symbol = original_symbol.replace('/', '')
+                                
+                                # Use direct API call to Alpaca
+                                base_url = "https://paper-api.alpaca.markets/v2/orders"
+                                headers = {
+                                    "APCA-API-KEY-ID": self.alpaca.api_key,
+                                    "APCA-API-SECRET-KEY": self.alpaca.api_secret,
+                                    "Content-Type": "application/json"
+                                }
+                                
+                                # Build basic market order
+                                order_data = {
+                                    "symbol": trading_symbol,
+                                    "qty": str(current_qty),
+                                    "side": side.lower(),
+                                    "type": "market",
+                                    "time_in_force": "gtc"
+                                }
+                                
+                                import requests
+                                response = requests.post(base_url, headers=headers, json=order_data)
+                                
+                                if response.status_code == 200:
+                                    order_dict = response.json()
+                                    logger.info(f"Direct market order successful: {order_dict.get('id')}")
+                                    return order_dict
+                                else:
+                                    logger.error(f"Direct market order failed: {response.text}")
+                            except Exception as direct_error:
+                                logger.error(f"Direct market order failed: {str(direct_error)}")
+                    
                     return {
                         "error": str(e),
                         "status": "rejected" 
