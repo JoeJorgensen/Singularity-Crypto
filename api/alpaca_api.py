@@ -79,22 +79,8 @@ class AlpacaAPI:
         if not isinstance(numeric_level, int):
             numeric_level = logging.INFO
         
-        self.logger.setLevel(numeric_level)
-        
-        # Check if handlers already exist to avoid duplicate log messages
-        if not self.logger.handlers:
-            # Create console handler
-            ch = logging.StreamHandler()
-            ch.setLevel(numeric_level)
-            
-            # Create formatter
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            
-            # Add formatter to handler
-            ch.setFormatter(formatter)
-            
-            # Add handler to logger
-            self.logger.addHandler(ch)
+        # Remove handlers setup which would bypass the global configuration
+        # Let the global configuration handle the logging setup
         
         # Initialize REST API client
         self.api = REST(

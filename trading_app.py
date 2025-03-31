@@ -29,7 +29,7 @@ from utils.order_manager import OrderManager
 from utils.logging_config import setup_logging, get_logger
 
 # Set up logging once at application startup
-setup_logging()
+setup_logging(enable_console_logging=False, enable_file_logging=False)
 logger = get_logger('trading_app')
 
 # Check for Streamlit secrets

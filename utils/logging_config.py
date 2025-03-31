@@ -48,12 +48,14 @@ class ColoredFormatter(logging.Formatter):
                 return f"{color}{message}{COLORS['RESET']}"
             return message
 
-def setup_logging(log_level: int = logging.INFO) -> logging.Logger:
+def setup_logging(log_level: int = logging.INFO, enable_console_logging: bool = False, enable_file_logging: bool = False) -> logging.Logger:
     """
     Set up application logging with console handler and file handler.
     
     Args:
         log_level: The logging level (default: logging.INFO)
+        enable_console_logging: Whether to enable console logging (default: False)
+        enable_file_logging: Whether to enable file logging (default: False)
     
     Returns:
         The configured root logger
@@ -66,40 +68,44 @@ def setup_logging(log_level: int = logging.INFO) -> logging.Logger:
     if root_logger.handlers:
         root_logger.handlers.clear()
     
-    # Create console handler with colored formatter
-    console_formatter = ColoredFormatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    
-    console_handler = logging.StreamHandler(stream=sys.stdout)
-    console_handler.setFormatter(console_formatter)
-    console_handler.setLevel(log_level)
-    root_logger.addHandler(console_handler)
-    
-    # Create file handler for logging to a file
-    try:
-        # Create logs directory if it doesn't exist
-        logs_dir = 'logs'
-        if not os.path.exists(logs_dir):
-            os.makedirs(logs_dir)
-            
-        # Use a simpler formatter for log files (no colors)
-        file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+    # Create console handler with colored formatter if enabled
+    if enable_console_logging:
+        console_formatter = ColoredFormatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%H:%M:%S'
         )
         
-        # Create the file handler
-        file_handler = logging.FileHandler(os.path.join(logs_dir, 'app.log'))
-        file_handler.setFormatter(file_formatter)
-        file_handler.setLevel(log_level)
-        root_logger.addHandler(file_handler)
-        
-        # Log a message to confirm file logging is set up
-        logging.info(f"File logging configured to {os.path.abspath(os.path.join(logs_dir, 'app.log'))}")
-    except Exception as e:
-        logging.warning(f"Could not set up file logging: {str(e)}")
+        console_handler = logging.StreamHandler(stream=sys.stdout)
+        console_handler.setFormatter(console_formatter)
+        console_handler.setLevel(log_level)
+        root_logger.addHandler(console_handler)
+    
+    # Create file handler for logging to a file if enabled
+    if enable_file_logging:
+        try:
+            # Create logs directory if it doesn't exist
+            logs_dir = 'logs'
+            if not os.path.exists(logs_dir):
+                os.makedirs(logs_dir)
+                
+            # Use a simpler formatter for log files (no colors)
+            file_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            
+            # Create the file handler
+            file_handler = logging.FileHandler(os.path.join(logs_dir, 'app.log'))
+            file_handler.setFormatter(file_formatter)
+            file_handler.setLevel(log_level)
+            root_logger.addHandler(file_handler)
+            
+            # Log a message to confirm file logging is set up
+            if enable_console_logging:
+                logging.info(f"File logging configured to {os.path.abspath(os.path.join(logs_dir, 'app.log'))}")
+        except Exception as e:
+            if enable_console_logging:
+                logging.warning(f"Could not set up file logging: {str(e)}")
     
     # Configure main application logger
     logger = logging.getLogger(LOGGER_NAME)
@@ -108,7 +114,8 @@ def setup_logging(log_level: int = logging.INFO) -> logging.Logger:
     # Configure module-specific loggers
     configure_module_loggers(log_level)
     
-    logging.info(f"Logging initialized at level {logging._levelToName[log_level]}")
+    if enable_console_logging:
+        logging.info(f"Logging initialized at level {logging._levelToName[log_level]}")
     
     return root_logger
 
