@@ -344,15 +344,13 @@ class TechnicalIndicators:
             
             # Money Flow Index (MFI)
             if len(df) >= 14 and all(col in df.columns for col in ['high', 'low', 'close', 'volume']):
-                mfi_values = ta.mfi(
+                df['mfi'] = ta.mfi(
                     high=df['high'],
                     low=df['low'],
                     close=df['close'],
                     volume=df['volume'],
                     length=14
                 )
-                # Explicitly cast to compatible dtype before assignment
-                df['mfi'] = mfi_values.astype(float)
                 logger.debug(f"Added MFI indicator, values: min={df['mfi'].min()}, max={df['mfi'].max()}, last={df['mfi'].iloc[-1]}")
             else:
                 logger.warning(f"Cannot add MFI: insufficient data (length: {len(df)}) or missing columns")
