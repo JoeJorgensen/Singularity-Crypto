@@ -71,14 +71,14 @@ class ColoredFormatter(logging.Formatter):
         
         return formatted_msg
 
-def setup_logging(log_level=logging.INFO, log_to_file=True, console_output=True):
+def setup_logging(log_level=logging.INFO, log_to_file=False, console_output=False):
     """
     Set up application logging with console and file handlers.
     
     Args:
         log_level: The logging level (default: logging.INFO)
-        log_to_file: Whether to log to file (default: True)
-        console_output: Whether to log to console (default: True)
+        log_to_file: Whether to log to file (default: False)
+        console_output: Whether to log to console (default: False)
     
     Returns:
         The configured root logger
