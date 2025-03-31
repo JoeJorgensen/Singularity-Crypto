@@ -521,7 +521,7 @@ class AlpacaAPI:
             self._ws_client = CryptoDataStream(
                 api_key=self.api_key,
                 secret_key=self.api_secret,
-                feed=CryptoFeed.US  # Always use US feed as required by project rules
+                feed="us"  # Use string "us" instead of CryptoFeed.US as required by Alpaca API
             )
             
             # Set connected flag
@@ -678,11 +678,7 @@ class AlpacaAPI:
             self._ws_client = CryptoDataStream(
                 api_key=self.api_key,
                 secret_key=self.api_secret,
-                feed=CryptoFeed.US,  # Always use US feed as required by project rules
-                max_reconnect_attempts=5,  # Add reconnection attempts
-                reconnect_timeout=1.0,  # Faster reconnection timeout
-                ping_interval=10.0,  # Set ping interval to maintain connection
-                ping_timeout=5.0  # Set ping timeout
+                feed="us"  # Use string "us" instead of CryptoFeed.US as required by Alpaca API
             )
             
             # Configure authentication parameters to be more aggressive
