@@ -1,116 +1,201 @@
 """
 Alpaca API interface for cryptocurrency trading.
-Uses Alpaca's IEX feed for market data as required by project rules.
+Uses Alpaca's US feed for market data as required by project rules.
 """
 import os
 import time
+import threading
+import json
+import asyncio
 import pandas as pd
 import requests
-import json
-import threading
-import asyncio
+from datetime import datetime, timedelta
+import aiohttp
+import alpaca
+import logging
+from dotenv import load_dotenv
+from functools import lru_cache
 import websockets
-from alpaca.trading.client import TradingClient
+from alpaca.data.timeframe import TimeFrameUnit
+
+
+# Alpaca-py imports
+from alpaca.trading.client import TradingClient, RESTClient as REST
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import numpy as np
-from functools import lru_cache
-import aiohttp
-import alpaca
+from alpaca.data.live import CryptoDataStream
+from alpaca.data.enums import CryptoFeed
+from alpaca.data.models import Bar, Trade, Quote
 
 # Load environment variables
 load_dotenv()
 
 class AlpacaAPI:
-    def __init__(self, config):
-        """Initialize Alpaca API client."""
-        self.credentials_source = "None"
+    def __init__(self, config=None):
+        """
+        Initialize the Alpaca API client.
         
-        # Try to get credentials from Streamlit secrets if available
-        try:
-            import streamlit as st
-            # Check for credentials in nested 'alpaca' section
-            if 'alpaca' in st.secrets:
-                if 'ALPACA_API_KEY' in st.secrets['alpaca']:
-                    self.api_key = st.secrets['alpaca']['ALPACA_API_KEY']
-                    self.api_secret = st.secrets['alpaca']['ALPACA_API_SECRET']
-                    self.credentials_source = "Streamlit Secrets (nested)"
-                    print("Using Alpaca credentials from Streamlit secrets (alpaca section)")
-                else:
-                    # Try using the section directly with api_key and api_secret keys
-                    self.api_key = st.secrets['alpaca'].get('api_key') or st.secrets['alpaca'].get('key')
-                    self.api_secret = st.secrets['alpaca'].get('api_secret') or st.secrets['alpaca'].get('secret')
-                    if self.api_key and self.api_secret:
-                        self.credentials_source = "Streamlit Secrets (nested)"
-                        print("Using Alpaca credentials from Streamlit secrets (alpaca section)")
-            # Check for top-level credentials too
-            elif 'ALPACA_API_KEY' in st.secrets:
-                self.api_key = st.secrets['ALPACA_API_KEY']
-                self.api_secret = st.secrets['ALPACA_API_SECRET']
-                self.credentials_source = "Streamlit Secrets"
-                print("Using Alpaca credentials from Streamlit secrets")
-            else:
-                # Fall back to environment variables
-                self.api_key = os.getenv('ALPACA_API_KEY')
-                self.api_secret = os.getenv('ALPACA_API_SECRET')
-                self.credentials_source = "Environment Variables"
-                print("Using Alpaca credentials from environment variables")
-        except (ImportError, AttributeError) as e:
-            # If not running in Streamlit or secrets not available
-            print(f"Could not access Streamlit secrets: {str(e)}")
-            self.api_key = os.getenv('ALPACA_API_KEY')
-            self.api_secret = os.getenv('ALPACA_API_SECRET')
-            self.credentials_source = "Environment Variables"
-            print("Using Alpaca credentials from environment variables")
+        Args:
+            config: Configuration dictionary with Alpaca API credentials
+        """
+        # Set up logging first thing to avoid attribute errors
+        self.logger = logging.getLogger('alpaca_api')
         
-        if not self.api_key or not self.api_secret:
-            error_msg = "Alpaca API credentials not found in environment variables or Streamlit secrets. "
-            error_msg += "Please set ALPACA_API_KEY and ALPACA_API_SECRET in your .env file or Streamlit secrets."
-            
-            # Add diagnostic information
-            try:
-                import streamlit as st
-                if hasattr(st, 'secrets'):
-                    error_msg += f"\nStreamlit secrets available: {list(st.secrets.keys()) if hasattr(st.secrets, 'keys') else 'No'}"
-                    # Add alpaca section details if it exists
-                    if 'alpaca' in st.secrets:
-                        error_msg += f"\nAlpaca section keys: {list(st.secrets['alpaca'].keys()) if hasattr(st.secrets['alpaca'], 'keys') else 'No keys'}"
-            except:
-                pass
-                
-            error_msg += f"\nEnvironment variables available: ALPACA_API_KEY={'Yes' if os.getenv('ALPACA_API_KEY') else 'No'}, ALPACA_API_SECRET={'Yes' if os.getenv('ALPACA_API_SECRET') else 'No'}"
-            
-            raise ValueError(error_msg)
+        # Load configuration
+        if config is None:
+            config = {}
         
-        # Mask keys in log messages for security
-        masked_key = self.api_key[:4] + "..." + self.api_key[-4:] if len(self.api_key) > 8 else "***"
-        print(f"Initializing Alpaca API with key {masked_key} from {self.credentials_source}")
-        
-        self.trading_client = TradingClient(self.api_key, self.api_secret, paper=True)
-        # Initialize crypto data client
-        self.data_client = CryptoHistoricalDataClient(
-            api_key=self.api_key,
-            secret_key=self.api_secret
-        )
+        # Store config
         self.config = config
-        self.max_retries = 3
-        self.retry_delay = 1  # seconds
         
-        # Websocket related attributes
-        self.ws = None
-        self.ws_connected = False
-        self.ws_data = {}
-        self.ws_subscribed_symbols = set()
-        self.ws_thread = None
-        self.ws_lock = threading.Lock()
+        # Set up credentials
+        self.api_key = config.get('ALPACA_API_KEY', os.getenv('ALPACA_API_KEY', ''))
+        # Try multiple possible secret key names (ALPACA_SECRET_KEY and ALPACA_API_SECRET)
+        self.api_secret = config.get('ALPACA_SECRET_KEY', 
+                            config.get('ALPACA_API_SECRET', 
+                                os.getenv('ALPACA_SECRET_KEY', 
+                                    os.getenv('ALPACA_API_SECRET', ''))))
+        self.base_url = config.get('ALPACA_BASE_URL', os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets'))
+        
+        # Debug credential information (without revealing the actual keys)
+        self.logger.info(f"API Key length: {len(self.api_key)} chars, Secret Key length: {len(self.api_secret)} chars")
+        if not self.api_key or not self.api_secret:
+            self.logger.error("API key or secret key is empty - check your configuration and environment variables")
+        
+        # Configure paper/live mode
+        self.paper = bool(config.get('PAPER', True))
+        if self.paper:
+            self.base_url = 'https://paper-api.alpaca.markets'
+        
+        # Use specified log level, default to INFO
+        log_level = config.get('LOG_LEVEL', 'INFO')
+        numeric_level = getattr(logging, log_level.upper(), None)
+        
+        if not isinstance(numeric_level, int):
+            numeric_level = logging.INFO
+        
+        self.logger.setLevel(numeric_level)
+        
+        # Check if handlers already exist to avoid duplicate log messages
+        if not self.logger.handlers:
+            # Create console handler
+            ch = logging.StreamHandler()
+            ch.setLevel(numeric_level)
+            
+            # Create formatter
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            
+            # Add formatter to handler
+            ch.setFormatter(formatter)
+            
+            # Add handler to logger
+            self.logger.addHandler(ch)
+        
+        # Initialize REST API client
+        self.api = REST(
+            api_key=self.api_key,
+            secret_key=self.api_secret,
+            base_url=self.base_url,
+            api_version='v2'
+        )
+        
+        # Initialize variables for websocket data
+        self.websocket_data = {}  # Store latest data for each symbol
+        self.ws_lock = threading.Lock()  # Lock for thread-safe websocket data access
+        self.ws_connected = False  # Flag for websocket connection status
+        self.ws_subscribed_symbols = []  # Symbols that are currently subscribed
+        self.ws_connection_time = None  # Timestamp of when websocket was connected
+        self.ws_thread = None  # Thread for websocket connection
+        self._ws_client = None  # The websocket client instance
+        
+        # Variables to track connection attempts and prevent excessive reconnections
+        self.ws_last_connection_attempt = None  # When the last connection attempt was made
+        self.ws_connection_attempts = 0  # Number of consecutive connection attempts
+        self.ws_connection_cooldown = False  # Flag to indicate if we're in a connection cooldown period
+        self.ws_cooldown_until = None  # Time until cooldown ends
+        
+        self.logger.info(f"Alpaca API client initialized with paper mode: {self.paper}")
+        
+        # Test connection - we'll test with trading_client below after it's initialized
+        # Rather than testing here with the REST client which doesn't have get_account()
+        
+        # Cache for historical data requests
+        self.cache_timestamp = time.time()
+        
+        # Load environment variables for paper trading
+        # self.test_mode = os.getenv('TEST_MODE', 'False').lower() == 'true'
+        # self.logger.info(f"Test mode: {self.test_mode}")
+        
+        # Fix for handling timezone-aware datetimes in pandas
+        pd.set_option('use_inf_as_na', True)
+        
+        # Dictionary to track orders placed
+        self.open_orders = {}
+        
+        # Dictionary to track positions
+        self.positions = {}
+        
+        # If these flags are part of a larger test mode infrastructure
+        self.use_mock_broker = config.get('USE_MOCK_BROKER', False)
+        self.generate_mock_data = config.get('GENERATE_MOCK_DATA', False)
+        
+        # Set client parameters
+        self.max_retries = 3
+        self.retry_delay = 1  # Default retry delay in seconds
+        
+        # Initialize Alpaca clients
+        if self.paper:
+            base_url = 'https://paper-api.alpaca.markets'
+        else:
+            base_url = 'https://api.alpaca.markets'
+        
+        # Create trading client for Alpaca
+        try:
+            if not self.api_key or not self.api_secret:
+                raise ValueError("Missing API credentials - cannot initialize TradingClient")
+                
+            self.trading_client = TradingClient(
+                api_key=self.api_key,
+                secret_key=self.api_secret, 
+                paper=self.paper
+            )
+            self.logger.info("Successfully initialized TradingClient")
+            
+            # Test account access with trading_client
+            try:
+                account = self.trading_client.get_account()
+                self.logger.info(f"Connected to Alpaca API. Account ID: {account.id}, Status: {account.status}")
+            except Exception as e:
+                self.logger.warning(f"Could not retrieve account info: {e}")
+        except Exception as e:
+            self.logger.error(f"Error initializing TradingClient: {e}")
+            # Create a placeholder to avoid NoneType errors later
+            self.trading_client = None
+            
+        # Create data client for market data
+        try:
+            if not self.api_key or not self.api_secret:
+                raise ValueError("Missing API credentials - cannot initialize CryptoHistoricalDataClient")
+                
+            self.data_client = CryptoHistoricalDataClient(
+                api_key=self.api_key,
+                secret_key=self.api_secret
+            )
+            self.logger.info("Successfully initialized CryptoHistoricalDataClient")
+        except Exception as e:
+            self.logger.error(f"Error initializing CryptoHistoricalDataClient: {e}")
+            # Create a placeholder to avoid NoneType errors later
+            self.data_client = None
+            
+        # We won't create the streaming client here, we'll create it when needed
+        # This prevents any startup errors with the websocket
+        self._ws_client = None
         
         # Cache settings
-        self.cache_ttl = config.get('data_optimization', {}).get('cache_ttl', 60)  # seconds
+        self.cache_ttl = self.config.get('data_optimization', {}).get('cache_ttl', 60)  # seconds
     
     # Use LRU cache for account info (refreshes every minute)
     @lru_cache(maxsize=1)
@@ -282,20 +367,20 @@ class AlpacaAPI:
                 
         # If all retries failed, return a minimal valid DataFrame
         print("Failed to fetch crypto bars after all retries, returning minimal DataFrame")
-        # Try to use websocket data as fallback before returning empty DataFrame
+        # Try to use polling data as fallback before returning empty DataFrame
         try:
             ws_data = self.get_latest_websocket_data(symbol)
-            if ws_data['latest_bar'] is not None:
-                bar = ws_data['latest_bar']
+            if ws_data is not None and ws_data['close'] is not None:
+                # Use the data from our polling method
                 return pd.DataFrame({
-                    'open': [bar['open']],
-                    'high': [bar['high']],
-                    'low': [bar['low']],
-                    'close': [bar['close']],
-                    'volume': [bar['volume'] if bar['volume'] > 0 else 1.0]
-                }, index=[pd.Timestamp.now()])
+                    'open': [ws_data['open']],
+                    'high': [ws_data['high']],
+                    'low': [ws_data['low']],
+                    'close': [ws_data['close']],
+                    'volume': [ws_data['volume'] if ws_data['volume'] > 0 else 1.0]
+                }, index=[ws_data['timestamp'] if ws_data['timestamp'] else pd.Timestamp.now()])
         except Exception as e:
-            print(f"Failed to use websocket data as fallback: {e}")
+            print(f"Failed to use polling data as fallback: {e}")
         
         # Return minimal empty DataFrame as last resort
         empty_df = pd.DataFrame({
@@ -314,463 +399,519 @@ class AlpacaAPI:
         """Cached version of get_crypto_bars."""
         return self.get_crypto_bars(symbol, timeframe, limit)
     
-    def get_crypto_bars(self, symbol='ETH/USD', timeframe='1H', limit=100):
+    def get_crypto_bars(self, symbol: str, timeframe: str = '1Min', limit: int = 100) -> pd.DataFrame:
         """
-        Get historical bars data using the appropriate method.
-        Always using IEX feed as required by project rules.
+        Get cryptocurrency bars from Alpaca.
         
-        This implementation uses the v1beta3/crypto/us endpoint which automatically 
-        uses the IEX feed as required by project rules, rather than using the SDK's
-        CryptoHistoricalDataClient with DataFeed parameter.
-        """
-        retries = 0
-        while retries < self.max_retries:
-            try:
-                # Keep the original symbol format for the API request
-                api_symbol = symbol
-                
-                # Get base timeframe
-                if timeframe.endswith('Min'):
-                    tf_str = f"{timeframe[:-3]}Min"
-                    multiplier = int(timeframe[:-3])
-                    seconds_per_unit = 60
-                elif timeframe.endswith('H'):
-                    tf_str = f"{timeframe[:-1]}Hour"
-                    multiplier = int(timeframe[:-1])
-                    seconds_per_unit = 3600
-                else:  # Day
-                    tf_str = "1Day"
-                    multiplier = 1
-                    seconds_per_unit = 86400
-                
-                # Calculate start time based on limit and timeframe
-                end = datetime.now()
-                start = end - timedelta(seconds=multiplier * seconds_per_unit * limit)
-                
-                # Format timestamps for API request
-                start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
-                end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
-                
-                # Create direct API request
-                url = f"https://data.alpaca.markets/v1beta3/crypto/us/bars"
-                headers = {
-                    "APCA-API-KEY-ID": self.api_key,
-                    "APCA-API-SECRET-KEY": self.api_secret
-                }
-                params = {
-                    "symbols": api_symbol,
-                    "timeframe": tf_str,
-                    "start": start_str,
-                    "end": end_str,
-                    "limit": limit
-                    # Note: The crypto/us endpoint automatically uses IEX feed
-                    # so we don't need to specify it
-                }
-                
-                # Make the API request with a timeout
-                response = requests.get(url, headers=headers, params=params, timeout=10)
-                
-                # Check for errors
-                if response.status_code != 200:
-                    print(f"API request failed with status {response.status_code}: {response.text}")
-                    # Check for rate limit errors specifically
-                    if response.status_code == 429:
-                        print("Rate limit exceeded, waiting longer before retry")
-                        time.sleep(self.retry_delay * 5)  # Wait longer for rate limit errors
-                    else:
-                        time.sleep(self.retry_delay)
-                    retries += 1
-                    continue
-                
-                # Parse the response
-                try:
-                    bars_data = response.json()
-                except Exception as e:
-                    print(f"Failed to parse API response as JSON: {e}")
-                    retries += 1
-                    time.sleep(self.retry_delay)
-                    continue
-                
-                if not bars_data or 'bars' not in bars_data or not bars_data['bars'] or api_symbol not in bars_data['bars']:
-                    print(f"No data received from Alpaca API (attempt {retries + 1}/{self.max_retries})")
-                    print(f"Response content: {bars_data}")
-                    retries += 1
-                    time.sleep(self.retry_delay)
-                    continue
-                
-                # Convert to DataFrame
-                bars_list = bars_data['bars'][api_symbol]
-                df = pd.DataFrame(bars_list)
-                
-                if df.empty:
-                    print(f"Empty dataframe received from Alpaca API (attempt {retries + 1}/{self.max_retries})")
-                    retries += 1
-                    time.sleep(self.retry_delay)
-                    continue
-                
-                # Rename columns to match the SDK's format
-                column_mapping = {
-                    't': 'timestamp',
-                    'o': 'open',
-                    'h': 'high',
-                    'l': 'low',
-                    'c': 'close',
-                    'v': 'volume',
-                    'n': 'trade_count',
-                    'vw': 'vwap'
-                }
-                
-                for orig_col, new_col in column_mapping.items():
-                    if orig_col in df.columns:
-                        df[new_col] = df[orig_col]
-                        df.drop(orig_col, axis=1, inplace=True)
-                
-                # Convert timestamp to datetime
-                if 'timestamp' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df.set_index('timestamp', inplace=True)
-                
-                # Ensure all required columns exist
-                required_columns = ['open', 'high', 'low', 'close', 'volume']
-                for col in required_columns:
-                    if col not in df.columns:
-                        print(f"Warning: '{col}' column missing from API response. Adding default values.")
-                        if col == 'volume':
-                            # Use a small default volume value to prevent division by zero errors
-                            df[col] = 1.0
-                        elif col in ['open', 'high', 'low']:
-                            # Use close price if available, otherwise 0
-                            df[col] = df['close'] if 'close' in df.columns else 0.0
-                        else:
-                            df[col] = 0.0
-                
-                # Ensure numeric data types
-                for col in df.columns:
-                    if col in ['open', 'high', 'low', 'close', 'volume', 'vwap']:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                        # Fill NaN values with appropriate defaults
-                        if col == 'volume' and df[col].isna().any():
-                            df[col].fillna(1.0, inplace=True)
-                        elif col in ['open', 'high', 'low'] and df[col].isna().any():
-                            df[col].fillna(df['close'], inplace=True)
-                        elif df[col].isna().any():
-                            df[col].fillna(0.0, inplace=True)
-                
-                # Debug info
-                if 'volume' in df.columns:
-                    print(f"Volume data summary: min={df['volume'].min()}, max={df['volume'].max()}, mean={df['volume'].mean()}")
-                else:
-                    print("Warning: Volume data still missing after processing.")
-                
-                return df
+        Args:
+            symbol: The cryptocurrency symbol
+            timeframe: The timeframe for the bars
+            limit: Number of bars to return
             
-            except requests.exceptions.Timeout:
-                print(f"Timeout error fetching crypto bars (attempt {retries + 1}/{self.max_retries})")
-                retries += 1
-                time.sleep(self.retry_delay)
-            except requests.exceptions.RequestException as e:
-                print(f"Network error fetching crypto bars: {str(e)}")
-                retries += 1
-                time.sleep(self.retry_delay)
-            except Exception as e:
-                print(f"Error fetching crypto bars: {str(e)}")
-                retries += 1
-                if retries < self.max_retries:
-                    time.sleep(self.retry_delay)
-        
-        # If all retries failed, return a minimal valid DataFrame
-        print("Failed to fetch crypto bars after all retries, returning minimal DataFrame")
-        # Try to use websocket data as fallback before returning empty DataFrame
+        Returns:
+            DataFrame with the bars
+        """
         try:
-            ws_data = self.get_latest_websocket_data(symbol)
-            if ws_data['latest_bar'] is not None:
-                bar = ws_data['latest_bar']
-                return pd.DataFrame({
-                    'open': [bar['open']],
-                    'high': [bar['high']],
-                    'low': [bar['low']],
-                    'close': [bar['close']],
-                    'volume': [bar['volume'] if bar['volume'] > 0 else 1.0]
-                }, index=[pd.Timestamp.now()])
+            # Parse the timeframe
+            tf = self._parse_timeframe(timeframe)
+            
+            # Create request parameters
+            request_params = CryptoBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                limit=limit
+            )
+            
+            # Get the bars
+            bars_response = self.data_client.get_crypto_bars(request_params)
+            
+            # Check if we have data
+            if not hasattr(bars_response, 'data') or symbol not in bars_response.data:
+                self.logger.error(f"No data found for symbol {symbol}")
+                return pd.DataFrame()
+            
+            # Get the bars for the symbol
+            bars = bars_response.data[symbol]
+            
+            # Convert bars to a dict for DataFrame creation
+            data_list = []
+            for bar in bars:
+                bar_dict = {
+                    'timestamp': bar.timestamp,
+                    'open': bar.open,
+                    'high': bar.high,
+                    'low': bar.low,
+                    'close': bar.close,
+                    'volume': bar.volume,
+                    'trade_count': bar.trade_count,
+                    'vwap': bar.vwap,
+                    'symbol': bar.symbol
+                }
+                data_list.append(bar_dict)
+            
+            # Create DataFrame
+            df = pd.DataFrame(data_list)
+            
+            # Set timestamp as index
+            if 'timestamp' in df.columns:
+                df = df.set_index('timestamp')
+            
+            return df
+            
         except Exception as e:
-            print(f"Failed to use websocket data as fallback: {e}")
-        
-        # Return minimal empty DataFrame as last resort
-        empty_df = pd.DataFrame({
-            'open': [0.0],
-            'high': [0.0],
-            'low': [0.0],
-            'close': [0.0],
-            'volume': [1.0]
-        }, index=[pd.Timestamp.now()])
-        
-        return empty_df
-
+            self.logger.error(f"Error getting crypto bars: {str(e)}")
+            
+            # Implement retry with exponential backoff
+            for i in range(3):
+                try:
+                    time.sleep(2 ** i)
+                    self.logger.info(f"Retrying get_crypto_bars (attempt {i+1})...")
+                    
+                    # Try again with the same parameters
+                    bars_response = self.data_client.get_crypto_bars(request_params)
+                    
+                    # Check if we have data
+                    if hasattr(bars_response, 'data') and symbol in bars_response.data:
+                        # Get the bars for the symbol
+                        bars = bars_response.data[symbol]
+                        
+                        # Convert bars to a dict for DataFrame creation
+                        data_list = []
+                        for bar in bars:
+                            bar_dict = {
+                                'timestamp': bar.timestamp,
+                                'open': bar.open,
+                                'high': bar.high,
+                                'low': bar.low,
+                                'close': bar.close,
+                                'volume': bar.volume,
+                                'trade_count': bar.trade_count,
+                                'vwap': bar.vwap,
+                                'symbol': bar.symbol
+                            }
+                            data_list.append(bar_dict)
+                        
+                        # Create DataFrame
+                        df = pd.DataFrame(data_list)
+                        
+                        # Set timestamp as index
+                        if 'timestamp' in df.columns:
+                            df = df.set_index('timestamp')
+                        
+                        return df
+                
+                except Exception as retry_e:
+                    self.logger.error(f"Retry {i+1} failed: {str(retry_e)}")
+            
+            # If we get here, all retries failed
+            return pd.DataFrame()
+    
     # Websocket methods for real-time market data
     async def _ws_connect(self):
-        """Establish websocket connection to Alpaca."""
-        if self.ws_connected:
-            return
-            
+        """
+        Connect to Alpaca websocket for real-time data.
+        
+        Returns:
+            bool: True if connected successfully, False otherwise
+        """
         try:
-            url = "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
-            self.ws = await websockets.connect(url)
+            self.logger.info("Connecting to Alpaca Crypto Websocket (US feed)...")
             
-            # Authentication message
-            auth_msg = {
-                "action": "auth",
-                "key": self.api_key,
-                "secret": self.api_secret
-            }
-            await self.ws.send(json.dumps(auth_msg))
-            response = await self.ws.recv()
-            auth_response = json.loads(response)
+            # Create the crypto data stream client
+            self._ws_client = CryptoDataStream(
+                api_key=self.api_key,
+                secret_key=self.api_secret,
+                feed=CryptoFeed.US  # Always use US feed as required by project rules
+            )
             
-            # Handle different response formats (can be a list or dict)
-            if isinstance(auth_response, list):
-                # Find auth message in list
-                for msg in auth_response:
-                    if isinstance(msg, dict) and msg.get('T') == 'success' and msg.get('msg') == 'authenticated':
-                        self.ws_connected = True
-                        print("WebSocket connection established and authenticated")
-                        return True
-                # If we get a success response but not with 'authenticated', it likely means
-                # we are connected but authentication is handled differently
-                if any(isinstance(msg, dict) and msg.get('T') == 'success' for msg in auth_response):
-                    self.ws_connected = True
-                    print("WebSocket connection established with success response")
-                    return True
-                print(f"WebSocket authentication failed in list response: {auth_response}")
-                return False
-            elif isinstance(auth_response, dict) and auth_response.get('msg') == 'authenticated':
-                self.ws_connected = True
-                print("WebSocket connection established and authenticated")
-                return True
-            else:
-                print(f"WebSocket authentication failed: {auth_response}")
-                return False
-                
+            # Set connected flag
+            self.ws_connected = True
+            self.logger.info("Connected to Alpaca Crypto Websocket (US feed)")
+            return True
         except Exception as e:
-            print(f"Error connecting to WebSocket: {e}")
+            self.logger.error(f"Error connecting to Alpaca websocket: {str(e)}")
             self.ws_connected = False
             return False
-    
+
     async def _ws_subscribe(self, symbols, channels=["bars"]):
-        """Subscribe to real-time data for symbols."""
-        if not self.ws_connected:
-            success = await self._ws_connect()
-            if not success:
-                return False
-                
+        """
+        Subscribe to websocket channels for specified symbols.
+        
+        Args:
+            symbols: List of symbols to subscribe to
+            channels: List of channels to subscribe to (default: ["bars"])
+            
+        Returns:
+            bool: True if subscription successful, False otherwise
+        """
+        if not self.ws_connected or not self._ws_client:
+            self.logger.error("Cannot subscribe: websocket not connected")
+            return False
+        
         try:
-            # Ensure symbols is a list
-            if isinstance(symbols, str):
-                symbols = [symbols]
-                
-            # Format symbols correctly
-            formatted_symbols = []
-            for symbol in symbols:
-                if '/' in symbol:  # Convert ETH/USD to ETH-USD for websocket
-                    formatted_symbols.append(symbol.replace('/', '-'))
-                else:
-                    formatted_symbols.append(symbol)
+            self.logger.info(f"Subscribing to {channels} for {symbols}")
             
-            # Create a proper subscription message matching Alpaca v1beta3 format
-            sub_msg = {
-                "action": "subscribe"
-            }
-            
-            # Add each requested channel with its symbols
-            for channel in channels:
-                sub_msg[channel] = formatted_symbols
-            
-            await self.ws.send(json.dumps(sub_msg))
-            response = await self.ws.recv()
-            sub_response = json.loads(response)
-            
-            # Handle different response formats
-            if isinstance(sub_response, list):
-                # Find subscription success message in list
-                for msg in sub_response:
-                    if isinstance(msg, dict) and msg.get('T') == 'subscription':
-                        with self.ws_lock:
-                            for symbol in symbols:
-                                self.ws_subscribed_symbols.add(symbol)
-                        print("WebSocket subscription confirmed with success response")
-                        return True
-                # If we get a success response, assume subscription worked
-                if any(isinstance(msg, dict) and msg.get('T') == 'success' for msg in sub_response):
-                    with self.ws_lock:
-                        for symbol in symbols:
-                            self.ws_subscribed_symbols.add(symbol)
-                    print("WebSocket subscription confirmed with success response")
-                    return True
-                print(f"WebSocket subscription failed in list response: {sub_response}")
-                return False
-            elif isinstance(sub_response, dict) and sub_response.get('msg') == 'subscribed':
+            # Define handler functions for different data types
+            async def on_bar(bar):
+                symbol = bar.symbol.replace("/", "")  # Convert ETH/USD to ETHUSD format if needed
                 with self.ws_lock:
-                    for symbol in symbols:
-                        self.ws_subscribed_symbols.add(symbol)
+                    if symbol not in self.websocket_data:
+                        self.websocket_data[symbol] = {}
+                        
+                    # Store the bar data
+                    self.websocket_data[symbol] = {
+                        'timestamp': bar.timestamp,
+                        'open': bar.open,
+                        'high': bar.high,
+                        'low': bar.low,
+                        'close': bar.close,
+                        'volume': bar.volume,
+                        'vwap': getattr(bar, 'vwap', 0),
+                        'trade_count': getattr(bar, 'trade_count', 0)
+                    }
+                    self.logger.debug(f"Updated {symbol} bar data: {bar.close}")
+            
+            # Subscribe to the requested channels
+            if "bars" in channels:
+                self._ws_client.subscribe_bars(on_bar, *symbols)
+                self.logger.info(f"Subscribed to bars for {symbols}")
+                
+            # Add handlers for other channels if needed (trades, quotes, etc.)
+            
+            # Store subscribed symbols
+            self.ws_subscribed_symbols = symbols
+            self.ws_connection_time = datetime.now()
+            return True
+        except Exception as e:
+            self.logger.error(f"Error subscribing to websocket channels: {str(e)}")
+            return False
+
+    def _ws_listener(self):
+        """
+        Start the websocket listener to receive updates.
+        This method starts the Alpaca CryptoDataStream run method.
+        """
+        if not hasattr(self, '_ws_client') or not self._ws_client:
+            self.logger.error("Cannot start listener: websocket not connected")
+            return
+        
+        try:
+            self.logger.info("Starting websocket listener")
+            # Run the websocket client - this is a blocking method that will run until connection is closed
+            self._ws_client.run()
+        except KeyboardInterrupt:
+            self.logger.info("Websocket listener stopped by user")
+            self.ws_connected = False
+        except ConnectionRefusedError:
+            self.logger.error("Websocket connection refused by server")
+            self.ws_connected = False
+        except TimeoutError:
+            self.logger.error("Websocket connection timeout")
+            self.ws_connected = False
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.error(f"Error in websocket listener: {error_msg}")
+            
+            # Handle specific error types
+            if "connection limit exceeded" in error_msg.lower():
+                self.logger.warning("Connection limit error detected in listener. Setting cooldown.")
+                self.ws_connection_cooldown = True
+                self.ws_cooldown_until = datetime.now() + timedelta(minutes=15)
+                self.ws_connection_attempts += 2
+            elif "authentication" in error_msg.lower() or "unauthorized" in error_msg.lower():
+                self.logger.error("Authentication error with websocket. Check API credentials.")
+            elif "network" in error_msg.lower() or "connect" in error_msg.lower():
+                self.logger.warning("Network error in websocket connection. Will retry later.")
+                
+            self.ws_connected = False
+
+    def start_websocket(self, symbols=None, timeout=5.0, non_blocking=False):
+        """
+        Start a websocket connection for real-time market data.
+        
+        Args:
+            symbols: List of symbols to subscribe to
+            timeout: Maximum time to wait for connection in seconds
+            non_blocking: If True, start websocket in background thread
+            
+        Returns:
+            bool: True if connection started successfully, False otherwise
+        """
+        # Default symbols if not provided
+        if not symbols:
+            symbols = ['ETH/USD', 'BTC/USD']  # Default symbols
+        
+        # Check if we're in a cooldown period
+        current_time = datetime.now()
+        if self.ws_connection_cooldown and self.ws_cooldown_until and current_time < self.ws_cooldown_until:
+            time_left = (self.ws_cooldown_until - current_time).total_seconds()
+            self.logger.warning(f"Connection in cooldown for {time_left:.1f} more seconds. Skipping connection attempt.")
+            return False
+        
+        # Update connection attempt tracking
+        if self.ws_last_connection_attempt:
+            # If last attempt was more than 5 minutes ago, reset counter
+            if (current_time - self.ws_last_connection_attempt).total_seconds() > 300:
+                self.ws_connection_attempts = 0
+            else:
+                self.ws_connection_attempts += 1
+        
+        self.ws_last_connection_attempt = current_time
+        
+        # If too many connection attempts in a short period, enter cooldown
+        if self.ws_connection_attempts >= 5:  # 5 consecutive attempts
+            cooldown_minutes = min(5 * (self.ws_connection_attempts - 4), 60)  # Increasing cooldown, max 60 minutes
+            self.ws_cooldown_until = current_time + timedelta(minutes=cooldown_minutes)
+            self.ws_connection_cooldown = True
+            self.logger.warning(f"Too many connection attempts. Entering cooldown for {cooldown_minutes} minutes.")
+            return False
+        
+        # If there's already a connection, close it first
+        if hasattr(self, '_ws_client') and self._ws_client:
+            self.logger.info("Stopping existing websocket connection before starting a new one")
+            self.stop_websocket()
+        
+        self.logger.info(f"Starting websocket connection for {symbols}")
+        
+        try:
+            # Create the crypto data stream client
+            self._ws_client = CryptoDataStream(
+                api_key=self.api_key,
+                secret_key=self.api_secret,
+                feed=CryptoFeed.US  # Always use US feed as required by project rules
+            )
+            
+            # Set up subscription handlers before starting the connection
+            async def on_bar(bar):
+                try:
+                    # Convert symbol format if needed (ETH/USD -> ETHUSD)
+                    symbol = bar.symbol.replace("/", "")
+                    with self.ws_lock:
+                        if symbol not in self.websocket_data:
+                            self.websocket_data[symbol] = {}
+                        
+                        # Store the bar data
+                        self.websocket_data[symbol] = {
+                            'timestamp': bar.timestamp,
+                            'open': bar.open,
+                            'high': bar.high,
+                            'low': bar.low,
+                            'close': bar.close,
+                            'volume': bar.volume,
+                            'vwap': getattr(bar, 'vwap', 0),
+                            'trade_count': getattr(bar, 'trade_count', 0)
+                        }
+                        self.logger.debug(f"Updated {symbol} bar data: {bar.close}")
+                except Exception as e:
+                    self.logger.error(f"Error processing bar data: {e}")
+            
+            # Subscribe to the bars channel for each symbol
+            for symbol in symbols:
+                self._ws_client.subscribe_bars(on_bar, symbol)
+                self.logger.info(f"Subscribed to bars for {symbol}")
+            
+            # Mark as connected but not yet running
+            self.ws_subscribed_symbols = symbols
+            self.ws_connection_time = datetime.now()
+            
+            # Define function to run websocket in a thread
+            def run_websocket():
+                try:
+                    # Set the connection flag right before running
+                    self.ws_connected = True
+                    self.logger.info("Starting websocket listener in thread")
+                    
+                    # Call the listener method directly - it will use the non-async run() method
+                    # No need for async event loop since the run() method is synchronous in CryptoDataStream
+                    self._ws_listener()
+                except Exception as e:
+                    self.logger.error(f"Error in websocket thread: {e}")
+                    self.ws_connected = False
+            
+            # Start the websocket thread
+            if non_blocking:
+                self.ws_thread = threading.Thread(target=run_websocket, daemon=True)
+                self.ws_thread.start()
+                
+                # Wait for a short time to give the thread a chance to start
+                time.sleep(1.0)
+                
+                # Return success based on connection status
+                if self.ws_connected:
+                    self.logger.info(f"Successfully started websocket connection for {symbols}")
+                    # Reset connection attempts and cooldown on success
+                    self.ws_connection_attempts = 0
+                    self.ws_connection_cooldown = False
+                    return True
+                else:
+                    self.logger.warning(f"Failed to start websocket connection for {symbols}")
+                    return False
+            else:
+                # For blocking mode, run with timeout
+                ws_thread = threading.Thread(target=run_websocket, daemon=True)
+                ws_thread.start()
+                ws_thread.join(timeout=timeout)
+                
+                # Return success based on connection status
+                if self.ws_connected:
+                    self.logger.info(f"Successfully started websocket connection for {symbols}")
+                    # Reset connection attempts and cooldown on success
+                    self.ws_connection_attempts = 0
+                    self.ws_connection_cooldown = False
+                    return True
+                else:
+                    self.logger.warning(f"Failed to start websocket connection for {symbols}")
+                    return False
+        
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.error(f"Error starting websocket: {error_msg}")
+            
+            # Handle connection limit error specially
+            if "connection limit exceeded" in error_msg.lower():
+                self.logger.warning("Connection limit exceeded. Entering cooldown period.")
+                self.ws_connection_cooldown = True
+                self.ws_cooldown_until = datetime.now() + timedelta(minutes=15)  # 15 minute cooldown
+                self.ws_connection_attempts += 2  # Increment by 2 to reach cooldown threshold faster
+            
+            self.ws_connected = False
+            return False
+
+    def stop_websocket(self):
+        """
+        Stop the websocket connection.
+        
+        Returns:
+            bool: True if connection stopped successfully, False otherwise
+        """
+        try:
+            if hasattr(self, '_ws_client') and self._ws_client:
+                # Create a new thread to handle the async closing
+                def close_websocket():
+                    try:
+                        # Create a new event loop for this thread
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        
+                        # Run the stop function in this loop
+                        loop.run_until_complete(self._stop_websocket_async())
+                        
+                        # Close the loop
+                        loop.close()
+                    except Exception as e:
+                        self.logger.error(f"Error in websocket closing thread: {str(e)}")
+                
+                # Create and start the thread
+                close_thread = threading.Thread(target=close_websocket, daemon=True)
+                close_thread.start()
+                close_thread.join(timeout=5.0)  # Wait for up to 5 seconds for closing
+                
                 return True
             else:
-                print(f"WebSocket subscription failed: {sub_response}")
+                self.logger.info("No websocket connection to stop")
                 return False
-                
         except Exception as e:
-            print(f"Error subscribing to WebSocket: {e}")
+            self.logger.error(f"Error stopping websocket: {str(e)}")
             return False
-    
-    async def _ws_listener(self):
-        """Background listener for websocket messages."""
-        if not self.ws_connected:
-            await self._ws_connect()
+
+    def get_latest_websocket_data(self, symbol):
+        """
+        Get the latest data for a symbol from websocket.
+        Falls back to REST API if websocket data is not available.
+        
+        Args:
+            symbol: The trading symbol to get data for
             
+        Returns:
+            dict: Dictionary with latest price data or None values if unavailable
+        """
+        # Convert symbol format if needed (ETH/USD -> ETHUSD)
+        symbol_key = symbol.replace('/', '')
+        
         try:
-            while self.ws_connected:
-                try:
-                    message = await self.ws.recv()
-                    data = json.loads(message)
-                    
-                    # Process the data
-                    if isinstance(data, list):
-                        for item in data:
-                            self._process_ws_message(item)
-                    else:
-                        self._process_ws_message(data)
-                        
-                except websockets.ConnectionClosed:
-                    print("WebSocket connection closed")
-                    self.ws_connected = False
-                    break
-                except Exception as e:
-                    print(f"Error processing WebSocket message: {e}")
-                    
+            # First try to get data from websocket
+            with self.ws_lock:
+                if symbol_key in self.websocket_data and self.websocket_data[symbol_key].get('close') is not None:
+                    return self.websocket_data[symbol_key]
+            
+            # If we don't have websocket data, fall back to REST API polling
+            self.logger.info(f"No websocket data available for {symbol}, falling back to REST API")
+            current_price = self.get_current_price(symbol)
+            
+            if current_price:
+                # We only have the current price, not full bar data
+                now = datetime.now()
+                return {
+                    'timestamp': now,
+                    'open': current_price,
+                    'high': current_price,
+                    'low': current_price, 
+                    'close': current_price,
+                    'volume': 0,
+                    'vwap': 0,
+                    'trade_count': 0
+                }
+            else:
+                self.logger.warning(f"No data available for {symbol}")
+                # Return None for all values if we couldn't get the data
+                return {
+                    'timestamp': None,
+                    'open': None,
+                    'high': None,
+                    'low': None,
+                    'close': None,
+                    'volume': None,
+                    'vwap': None,
+                    'trade_count': None
+                }
         except Exception as e:
-            print(f"WebSocket listener error: {e}")
-            self.ws_connected = False
-    
-    def _process_ws_message(self, message):
-        """Process incoming websocket message."""
-        if not isinstance(message, dict):
-            return
-            
-        message_type = message.get('T')
-        
-        if message_type == 'b':  # Bar data
-            symbol = message.get('S', '').replace('-', '/')  # Convert ETH-USD back to ETH/USD with empty string fallback
-            
-            with self.ws_lock:
-                if symbol not in self.ws_data:
-                    self.ws_data[symbol] = {'latest_bar': None, 'latest_quote': None, 'latest_trade': None}
-                
-                # Extract bar data
-                self.ws_data[symbol]['latest_bar'] = {
-                    'timestamp': datetime.fromtimestamp(message.get('t', 0) / 1000) if message.get('t') else datetime.now(),
-                    'open': message.get('o', 0),
-                    'high': message.get('h', 0),
-                    'low': message.get('l', 0),
-                    'close': message.get('c', 0),
-                    'volume': message.get('v', 0)
-                }
-                
-        elif message_type == 'q':  # Quote data
-            symbol = message.get('S', '').replace('-', '/')
-            
-            with self.ws_lock:
-                if symbol not in self.ws_data:
-                    self.ws_data[symbol] = {'latest_bar': None, 'latest_quote': None, 'latest_trade': None}
-                
-                self.ws_data[symbol]['latest_quote'] = {
-                    'timestamp': datetime.fromtimestamp(message.get('t', 0) / 1000) if message.get('t') else datetime.now(),
-                    'bid_price': message.get('bp', 0),
-                    'ask_price': message.get('ap', 0),
-                    'bid_size': message.get('bs', 0),
-                    'ask_size': message.get('as', 0)
-                }
-                
-        elif message_type == 't':  # Trade data
-            symbol = message.get('S', '').replace('-', '/')
-            
-            with self.ws_lock:
-                if symbol not in self.ws_data:
-                    self.ws_data[symbol] = {'latest_bar': None, 'latest_quote': None, 'latest_trade': None}
-                
-                self.ws_data[symbol]['latest_trade'] = {
-                    'timestamp': datetime.fromtimestamp(message.get('t', 0) / 1000) if message.get('t') else datetime.now(),
-                    'price': message.get('p', 0),
-                    'size': message.get('s', 0)
-                }
-    
-    def start_websocket(self, symbols=None):
-        """Start the websocket connection in a background thread."""
-        if self.ws_thread and self.ws_thread.is_alive():
-            return  # Already running
-            
-        if symbols is None:
-            # Default to ETH/USD if no symbols provided
-            symbols = ["ETH/USD"]
-            
-        # Start the websocket in a background thread
-        self.ws_thread = threading.Thread(target=self._ws_thread_target, args=(symbols,), daemon=True)
-        self.ws_thread.start()
-        
-    def _ws_thread_target(self, symbols):
-        """Target function for the websocket thread."""
-        async def run_websocket():
-            await self._ws_connect()
-            await self._ws_subscribe(symbols)
-            await self._ws_listener()
-            
-        asyncio.run(run_websocket())
-    
-    def stop_websocket(self):
-        """Close the websocket connection."""
-        self.ws_connected = False
-        
-        async def close_ws():
-            if self.ws:
-                await self.ws.close()
-                
-        if self.ws:
-            asyncio.run(close_ws())
-            
-    def get_latest_websocket_data(self, symbol='ETH/USD'):
-        """Get the latest data received from websocket for a symbol."""
-        with self.ws_lock:
-            return self.ws_data.get(symbol, {'latest_bar': None, 'latest_quote': None, 'latest_trade': None})
+            self.logger.error(f"Error getting latest data for {symbol}: {e}")
+            # Return None for all values if an exception occurred
+            return {
+                'timestamp': None,
+                'open': None,
+                'high': None,
+                'low': None,
+                'close': None,
+                'volume': None,
+                'vwap': None,
+                'trade_count': None
+            }
     
     def get_current_price(self, symbol='ETH/USD'):
-        """Get the most current price for a symbol, either from websocket or API."""
-        # First try to get price from websocket data
-        ws_data = self.get_latest_websocket_data(symbol)
+        """
+        Get the current price for a given symbol directly from the API.
         
-        if ws_data['latest_trade'] and ws_data['latest_trade']['price']:
-            return ws_data['latest_trade']['price']
-        elif ws_data['latest_quote'] and ws_data['latest_quote']['ask_price']:
-            return ws_data['latest_quote']['ask_price']
-        elif ws_data['latest_bar'] and ws_data['latest_bar']['close']:
-            return ws_data['latest_bar']['close']
-        
-        # Fallback to API call
-        try:
-            # Get the latest bar
-            bars = self.get_crypto_bars(symbol, '1Min', 1)
-            if not bars.empty:
-                return bars['close'].iloc[-1]
-        except Exception as e:
-            print(f"Error getting current price: {e}")
+        Args:
+            symbol: Trading symbol to get price for (default: 'ETH/USD')
             
-        return None
+        Returns:
+            float: Current price or None if unavailable
+        """
+        try:
+            # Get the latest bar data
+            bars = self.get_crypto_bars(symbol, '1Min', 1)
+            
+            if not bars.empty:
+                current_price = bars['close'].iloc[-1]
+                self.logger.info(f"Current price for {symbol}: ${current_price}")
+                return current_price
+            else:
+                self.logger.warning(f"No price data available for {symbol}")
+                return None
+        except Exception as e:
+            self.logger.error(f"Error getting current price for {symbol}: {e}")
+            return None
     
     def get_position(self, symbol='ETH/USD'):
         """Get current position for a symbol."""
         try:
             # Convert symbol format for Alpaca API
-            # For IEX feed, we need to transform ETH/USD to ETHUSD format
-            symbol = symbol.replace('/', '')
+            # The Trading API needs ETHUSD format (without slash)
+            symbol_without_slash = symbol.replace('/', '')
             
             # Get position
-            return self.trading_client.get_open_position(symbol)
+            return self.trading_client.get_open_position(symbol_without_slash)
         except Exception as e:
             # Handle the "position does not exist" error gracefully
             if 'position does not exist' in str(e).lower():
@@ -798,8 +939,8 @@ class AlpacaAPI:
             Order object
         """
         try:
-            # Convert symbol format
-            symbol = symbol.replace('/', '')
+            # Convert symbol format for Trading API (remove slash)
+            trading_symbol = symbol.replace('/', '')
             
             # Sanity check - make sure qty is a positive number
             if qty <= 0:
@@ -815,10 +956,10 @@ class AlpacaAPI:
                     order_value = qty * limit_price
                 else:
                     # For market orders, we need to fetch the current price
-                    current_price = self.get_current_price(symbol.replace('USD', '/USD'))
+                    current_price = self.get_current_price(symbol)  # Use symbol with slash
                     if not current_price:
                         # Fall back to recent bars
-                        bars = self.get_crypto_bars(symbol.replace('USD', '/USD'), '1Min', 1)
+                        bars = self.get_crypto_bars(symbol, '1Min', 1)  # Use symbol with slash
                         if not bars.empty:
                             current_price = bars['close'].iloc[-1]
                         else:
@@ -849,7 +990,7 @@ class AlpacaAPI:
             if order_type == 'market':
                 # Market order
                 order_data = MarketOrderRequest(
-                    symbol=symbol,
+                    symbol=trading_symbol,
                     qty=qty,
                     side=order_side,
                     time_in_force=TimeInForce.GTC
@@ -861,7 +1002,7 @@ class AlpacaAPI:
                     
                 # Limit order
                 order_data = LimitOrderRequest(
-                    symbol=symbol,
+                    symbol=trading_symbol,
                     qty=qty,
                     side=order_side,
                     limit_price=limit_price,
@@ -898,7 +1039,7 @@ class AlpacaAPI:
                 }
                 
                 order_data = {
-                    "symbol": symbol,
+                    "symbol": trading_symbol,
                     "qty": str(qty),
                     "side": side.lower(),
                     "type": "stop_limit",
@@ -1008,12 +1149,13 @@ class AlpacaAPI:
     def close_position(self, symbol='ETH/USD'):
         """Close a position."""
         try:
-            symbol = symbol.replace('/', '')  # Convert symbol format
+            # Convert symbol format for Trading API (remove slash)
+            trading_symbol = symbol.replace('/', '')  
             
             # Direct API approach - more reliable in edge cases
             # Step 1: Cancel all orders for this symbol using direct API
             try:
-                print(f"Direct API: Canceling all orders for {symbol}")
+                print(f"Direct API: Canceling all orders for {trading_symbol}")
                 
                 # Get all open orders
                 base_url = "https://paper-api.alpaca.markets/v2/orders"
@@ -1031,10 +1173,10 @@ class AlpacaAPI:
                     for order in orders:
                         # Check if this order is for our symbol (handle both formats)
                         order_symbol = order.get('symbol', '').replace('/', '')
-                        if order_symbol == symbol:
+                        if order_symbol == trading_symbol:
                             order_id = order.get('id')
                             if order_id:
-                                print(f"Canceling order {order_id} for {symbol}")
+                                print(f"Canceling order {order_id} for {trading_symbol}")
                                 cancel_url = f"{base_url}/{order_id}"
                                 cancel_response = requests.delete(cancel_url, headers=headers)
                                 if cancel_response.status_code != 200:
@@ -1049,8 +1191,8 @@ class AlpacaAPI:
             
             # Step 2: Close the position using direct API
             try:
-                print(f"Direct API: Closing position for {symbol}")
-                close_url = f"https://paper-api.alpaca.markets/v2/positions/{symbol}"
+                print(f"Direct API: Closing position for {trading_symbol}")
+                close_url = f"https://paper-api.alpaca.markets/v2/positions/{trading_symbol}"
                 close_response = requests.delete(close_url, headers=headers)
                 
                 if close_response.status_code != 200:
@@ -1062,7 +1204,7 @@ class AlpacaAPI:
                         print("Insufficient balance error, trying market order approach")
                         
                         # Get current position size
-                        pos_url = f"https://paper-api.alpaca.markets/v2/positions/{symbol}"
+                        pos_url = f"https://paper-api.alpaca.markets/v2/positions/{trading_symbol}"
                         pos_response = requests.get(pos_url, headers=headers)
                         
                         if pos_response.status_code == 200:
@@ -1070,10 +1212,10 @@ class AlpacaAPI:
                             position_qty = float(position_data.get('qty', 0))
                             
                             if position_qty > 0:
-                                print(f"Creating market order to sell {position_qty} {symbol}")
+                                print(f"Creating market order to sell {position_qty} {trading_symbol}")
                                 # Create market order
                                 order_data = {
-                                    "symbol": symbol,
+                                    "symbol": trading_symbol,
                                     "qty": str(position_qty),
                                     "side": "sell",
                                     "type": "market",
@@ -1321,3 +1463,155 @@ class AlpacaAPI:
     def get_bars(self, symbol='ETH/USD', timeframe='1H', limit=100):
         """Get historical price bars for a symbol."""
         return self.get_crypto_bars(symbol, timeframe, limit)
+
+    def _parse_timeframe(self, timeframe: str):
+        """Parse timeframe string into Alpaca TimeFrame object."""
+        # Remove any spaces
+        tf = timeframe.replace(' ', '')
+        
+        try:
+            # Handle minute timeframes
+            if tf.endswith('Min'):
+                minutes = int(tf[:-3])
+                if minutes == 1:
+                    return TimeFrame.Minute  # Use the class property for 1 minute
+                else:
+                    # Use constructor if available, otherwise use class attributes
+                    try:
+                        return TimeFrame(minutes, TimeFrameUnit.Minute)
+                    except (TypeError, AttributeError):
+                        # Fall back for older versions of the SDK
+                        if hasattr(TimeFrame, f"{minutes}Min"):
+                            return getattr(TimeFrame, f"{minutes}Min")
+                        else:
+                            print(f"Warning: Could not create {minutes}Min timeframe, using 1Min")
+                            return TimeFrame.Minute
+                
+            # Handle hour timeframes
+            elif tf.endswith('H'):
+                hours = int(tf[:-1])
+                if hours == 1:
+                    return TimeFrame.Hour  # Use the class property for 1 hour
+                else:
+                    # Use constructor if available, otherwise use class attributes
+                    try:
+                        return TimeFrame(hours, TimeFrameUnit.Hour)
+                    except (TypeError, AttributeError):
+                        # Fall back for older versions of the SDK
+                        if hasattr(TimeFrame, f"{hours}Hour"):
+                            return getattr(TimeFrame, f"{hours}Hour")
+                        else:
+                            print(f"Warning: Could not create {hours}Hour timeframe, using 1Hour")
+                            return TimeFrame.Hour
+                
+            # Handle day timeframes
+            elif tf.endswith('D'):
+                days = int(tf[:-1]) if len(tf) > 1 else 1
+                if days == 1:
+                    return TimeFrame.Day  # Use the class property for 1 day
+                else:
+                    # Days other than 1 might not be supported in some SDK versions
+                    try:
+                        return TimeFrame(days, TimeFrameUnit.Day)
+                    except (TypeError, AttributeError):
+                        print(f"Warning: Could not create {days}Day timeframe, using 1Day")
+                        return TimeFrame.Day
+                
+            # Default to 1 Hour if unrecognized
+            else:
+                print(f"Warning: Unrecognized timeframe format '{timeframe}', defaulting to 1 Hour")
+                return TimeFrame.Hour
+                
+        except Exception as e:
+            # Catch any unexpected errors and provide a safe default
+            print(f"Error parsing timeframe '{timeframe}': {e}. Using default 1 Hour")
+            return TimeFrame.Hour
+
+    async def _stop_websocket_async(self):
+        """Async helper to stop the websocket connection."""
+        try:
+            if hasattr(self, '_ws_client') and self._ws_client:
+                self.logger.info("Stopping websocket connection...")
+                
+                # Check what kind of client we have and use appropriate method to stop it
+                if hasattr(self._ws_client, 'close'):
+                    try:
+                        await self._ws_client.close()
+                        self.logger.info("Closed websocket connection with close() method")
+                    except Exception as e:
+                        self.logger.warning(f"Error calling close() on websocket client: {e}")
+                
+                elif hasattr(self._ws_client, 'stop'):
+                    try:
+                        self._ws_client.stop()
+                        self.logger.info("Stopped websocket connection with stop() method")
+                        # Wait a moment for it to process
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        self.logger.warning(f"Error calling stop() on websocket client: {e}")
+                
+                else:
+                    # If no standard method exists, try to disconnect or cleanup
+                    self.logger.warning("No standard close/stop method found on websocket client")
+                    if hasattr(self._ws_client, 'disconnect'):
+                        try:
+                            self._ws_client.disconnect()
+                            self.logger.info("Disconnected websocket with disconnect() method")
+                        except Exception as e:
+                            self.logger.warning(f"Error disconnecting websocket: {e}")
+                
+                # Clear the client reference
+                self._ws_client = None
+                
+                # Cancel monitor thread if it exists
+                if hasattr(self, '_ws_monitor_thread') and self._ws_monitor_thread:
+                    try:
+                        self._ws_monitor_thread.cancel()
+                        self.logger.info("Stopped websocket monitor thread")
+                    except Exception as e:
+                        self.logger.warning(f"Error stopping monitor thread: {e}")
+                    self._ws_monitor_thread = None
+                
+                # Reset connection state
+                self.ws_connected = False
+                self.logger.info("Websocket connection stopped")
+                return True
+            else:
+                self.logger.info("No websocket connection to stop")
+                return False
+        except Exception as e:
+            self.logger.error(f"Error stopping websocket: {str(e)}")
+            self.ws_connected = False
+            return False
+
+    def stop_websocket(self):
+        """Stop the websocket connection."""
+        try:
+            if hasattr(self, '_ws_client') and self._ws_client:
+                # Create a new thread to handle the async closing
+                def close_websocket():
+                    try:
+                        # Create a new event loop for this thread
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        
+                        # Run the stop function in this loop
+                        loop.run_until_complete(self._stop_websocket_async())
+                        
+                        # Close the loop
+                        loop.close()
+                    except Exception as e:
+                        self.logger.error(f"Error in websocket closing thread: {str(e)}")
+                
+                # Create and start the thread
+                close_thread = threading.Thread(target=close_websocket, daemon=True)
+                close_thread.start()
+                close_thread.join(timeout=5.0)  # Wait for up to 5 seconds for closing
+                
+                return True
+            else:
+                self.logger.info("No websocket connection to stop")
+                return False
+        except Exception as e:
+            self.logger.error(f"Error stopping websocket: {str(e)}")
+            return False

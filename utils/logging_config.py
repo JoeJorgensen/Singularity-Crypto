@@ -5,6 +5,7 @@ Provides a consistent logging setup with terminal-only output.
 import logging
 import sys
 from typing import Optional
+import os
 
 # Global logger name
 LOGGER_NAME = "CryptoTrader"
@@ -49,7 +50,7 @@ class ColoredFormatter(logging.Formatter):
 
 def setup_logging(log_level: int = logging.INFO) -> logging.Logger:
     """
-    Set up application logging with console handler only.
+    Set up application logging with console handler and file handler.
     
     Args:
         log_level: The logging level (default: logging.INFO)
@@ -75,6 +76,30 @@ def setup_logging(log_level: int = logging.INFO) -> logging.Logger:
     console_handler.setFormatter(console_formatter)
     console_handler.setLevel(log_level)
     root_logger.addHandler(console_handler)
+    
+    # Create file handler for logging to a file
+    try:
+        # Create logs directory if it doesn't exist
+        logs_dir = 'logs'
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+            
+        # Use a simpler formatter for log files (no colors)
+        file_formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Create the file handler
+        file_handler = logging.FileHandler(os.path.join(logs_dir, 'app.log'))
+        file_handler.setFormatter(file_formatter)
+        file_handler.setLevel(log_level)
+        root_logger.addHandler(file_handler)
+        
+        # Log a message to confirm file logging is set up
+        logging.info(f"File logging configured to {os.path.abspath(os.path.join(logs_dir, 'app.log'))}")
+    except Exception as e:
+        logging.warning(f"Could not set up file logging: {str(e)}")
     
     # Configure main application logger
     logger = logging.getLogger(LOGGER_NAME)

@@ -76,4 +76,37 @@ class OpenAIAPI:
             'target_price': None,
             'timeframe': timeframe,
             'reasoning': 'Insufficient data for confident prediction'
+        }
+        
+    def get_sentiment(self, symbol: str) -> Dict:
+        """
+        Get sentiment data for a specific symbol.
+        
+        Args:
+            symbol: Symbol to get sentiment for (e.g., 'BTC', 'ETH')
+            
+        Returns:
+            Dictionary with sentiment data
+        """
+        # Clean symbol (remove /USD or similar)
+        if '/' in symbol:
+            symbol = symbol.split('/')[0]
+            
+        # For demonstration purposes, return simulated sentiment data
+        import random
+        
+        # Generate random sentiment score between -0.5 and 0.7
+        sentiment_score = random.uniform(-0.5, 0.7)
+        
+        # Adjust sentiment for common cryptos to make it realistic
+        if symbol.upper() == 'BTC':
+            sentiment_score = max(0.1, sentiment_score)  # Bias towards positive
+        elif symbol.upper() == 'ETH':
+            sentiment_score = max(-0.1, sentiment_score)  # Slightly positive bias
+            
+        return {
+            'symbol': symbol,
+            'sentiment_score': sentiment_score,
+            'news_count': random.randint(5, 50),
+            'source': 'openai_simulated'
         } 

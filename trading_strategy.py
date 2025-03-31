@@ -11,6 +11,7 @@ import asyncio
 import aiohttp
 import threading
 from functools import lru_cache
+import os
 
 import pandas as pd
 import numpy as np
@@ -38,27 +39,52 @@ class TradingStrategy:
     
     def __init__(self, config: Optional[Dict] = None):
         """
-        Initialize TradingStrategy with configuration.
-        
+        Initialize trading strategy.
+
         Args:
-            config: Configuration dictionary with trading parameters
+            config: Configuration dictionary
         """
-        self.config = config or {}
-        logger.info("Initializing Trading Strategy with config")
-        self.apis = self._initialize_apis()
-        self.signal_generator = SignalGenerator(config)
-        self.risk_manager = RiskManager(config)
-        self.position_calculator = PositionCalculator(self.risk_manager, config)
-        self.order_manager = OrderManager(self.apis['alpaca'], config)
+        # Setup logging
+        self.logger = logging.getLogger('CryptoTrader.trading_strategy')
+        if not self.logger.handlers:
+            self.logger.setLevel(logging.INFO)
+            
+        self.logger.info("Initializing Trading Strategy with config")
         
-        # Default settings
-        self.default_pair = self.config.get('trading', {}).get('default_pair', "ETH/USD")
-        self.default_timeframe = self.config.get('trading', {}).get('timeframe', "1h")
+        # Initialize from provided config or default
+        self.config = config or {}
+        
+        # Flag to track websocket initialization
+        self.ws_initialization_attempted = False
+        
+        # Initialize API connections
+        self.apis = self._initialize_apis()
+        
+        # Default trading parameters
+        self.default_pair = self.config.get('trading', {}).get('default_pair', 'ETH/USD')
+        self.default_timeframe = self.config.get('trading', {}).get('timeframe', '1Hour')
+        
+        # Initialize cache
+        self.signal_cache = {}
+        self.sentiment_cache = {}
+        self.sentiment_ttl = 60  # Default TTL for sentiment data in seconds
+        
+        # Initialize trade tracking
+        self.last_trade_time = datetime.now() - timedelta(hours=1)  # Start with allowing trades
+        self.min_time_between_trades = timedelta(minutes=self.config.get('risk_management', {}).get('min_time_between_trades_min', 15))
+        
+        # Trading state
+        self.is_trading_active = False
+        
+        logger.info("Initializing Trading Strategy with config")
+        self.signal_generator = SignalGenerator(self.config)
+        self.risk_manager = RiskManager(self.config)
+        self.position_calculator = PositionCalculator(self.risk_manager, self.config)
+        self.order_manager = OrderManager(self.apis['alpaca'], self.config)
         
         # Trading state
         self.is_active = False
         self.last_signal_time = None
-        self.last_trade_time = None
         self.current_signal = None
         self.cycle_count = 0
         
@@ -73,14 +99,14 @@ class TradingStrategy:
         self.risk_per_trade = self.config.get('risk_management', {}).get('risk_per_trade', 0.02)
         logger.info(f"Trading Strategy initialized with default pair: {self.default_pair}, timeframe: {self.default_timeframe}")
         
-        # Start websocket for default pair
-        if isinstance(self.apis['alpaca'], AlpacaAPI):
-            try:
-                self.apis['alpaca'].start_websocket([self.default_pair])
-                logger.info(f"Started websocket connection for {self.default_pair}")
-            except Exception as e:
-                logger.error(f"Failed to start websocket connection: {str(e)}")
+        # Track last price cache time for controlling updates
+        self.last_price_cache_time = {}
+        self.last_sentiment_cache_time = {}  # Add missing initialization
         
+        # Configure market data caching
+        self.market_data_ttl = self.config.get('data_optimization', {}).get('cache_ttl', 60)  # seconds
+        self.sentiment_data_ttl = self.config.get('data_optimization', {}).get('sentiment_ttl', 300)  # seconds
+    
     def _initialize_apis(self) -> Dict:
         """
         Initialize API clients.
@@ -88,21 +114,86 @@ class TradingStrategy:
         Returns:
             Dictionary with API clients
         """
+        apis = {}
+        
+        # Initialize Alpaca API
         try:
-            alpaca = AlpacaAPI(config=self.config)
-            finnhub = FinnhubAPI()
-            openai = OpenAIAPI()
-            coinlore = CoinloreAPI()
+            self.logger.info("Initializing Alpaca API with config")
+            alpaca_api = AlpacaAPI(self.config)
+            apis['alpaca'] = alpaca_api
             
-            return {
-                'alpaca': alpaca,
-                'finnhub': finnhub,
-                'openai': openai,
-                'coinlore': coinlore
-            }
+            # Check if websocket initialization has already been attempted
+            if not hasattr(self, 'ws_initialization_attempted') or not self.ws_initialization_attempted:
+                # Mark as attempted to prevent duplicate initializations
+                self.ws_initialization_attempted = True
+                
+                # Start websocket connection for real-time data
+                # We start this in a thread to avoid blocking initialization
+                # List of symbols to monitor
+                symbols_to_monitor = self.config.get('trading', {}).get(
+                    'supported_pairs', 
+                    ['ETH/USD', 'BTC/USD', 'LTC/USD', 'BCH/USD', 'XRP/USD']
+                )
+                
+                # Define background function for starting websocket
+                def start_ws_in_background():
+                    try:
+                        self.logger.info(f"Starting websocket connection for {symbols_to_monitor} in background")
+                        # Start with a short timeout for initial connection
+                        result = alpaca_api.start_websocket(
+                            symbols=symbols_to_monitor,
+                            timeout=5.0, 
+                            non_blocking=True
+                        )
+                        
+                        if result:
+                            self.logger.info(f"Websocket connection started successfully for {symbols_to_monitor}")
+                        else:
+                            self.logger.warning(f"Websocket connection failed to start for {symbols_to_monitor}, using REST API polling as fallback")
+                    except Exception as e:
+                        self.logger.error(f"Error starting websocket: {str(e)}")
+                        self.logger.info("Continuing with REST API polling as fallback")
+                
+                # Start websocket thread - only done once per application instance
+                self.logger.info(f"Starting websocket connection for {symbols_to_monitor} in background")
+                ws_thread = threading.Thread(target=start_ws_in_background, daemon=True)
+                ws_thread.start()
+                self.logger.info("Websocket initialization triggered in background thread")
+            else:
+                self.logger.info("Websocket initialization already attempted, skipping redundant initialization")
         except Exception as e:
-            print(f"Error initializing APIs: {e}")
-            return {}
+            self.logger.error(f"Error initializing Alpaca API: {str(e)}")
+            apis['alpaca'] = None
+        
+        # Initialize Finnhub API
+        try:
+            self.logger.info("Initializing Finnhub API")
+            finnhub_api = FinnhubAPI()
+            apis['finnhub'] = finnhub_api
+        except Exception as e:
+            self.logger.error(f"Error initializing Finnhub API: {str(e)}")
+            apis['finnhub'] = None
+            
+        # Initialize OpenAI API
+        try:
+            self.logger.info("Initializing OpenAI API")
+            openai_api = OpenAIAPI()
+            apis['openai'] = openai_api
+        except Exception as e:
+            self.logger.error(f"Error initializing OpenAI API: {str(e)}")
+            apis['openai'] = None
+            
+        # Initialize CoinLore API
+        try:
+            self.logger.info("Initializing CoinLore API")
+            coinlore_api = CoinloreAPI()
+            apis['coinlore'] = coinlore_api
+        except Exception as e:
+            self.logger.error(f"Error initializing CoinLore API: {str(e)}")
+            apis['coinlore'] = None
+        
+        # Return the dictionary of API connections
+        return apis
     
     async def get_market_data_async(self, symbol: str = None, timeframe: str = None, limit: int = 100) -> pd.DataFrame:
         """
@@ -150,76 +241,103 @@ class TradingStrategy:
     
     def get_sentiment_data(self, symbol: str = None, market_data: Optional[pd.DataFrame] = None) -> Dict:
         """
-        Get sentiment data for a trading pair.
-        Uses caching to reduce API calls.
+        Get sentiment data for the specified trading symbol.
         
         Args:
-            symbol: Trading pair symbol (default: use default_pair)
-            market_data: Optional market data for dynamic TTL calculation
+            symbol: Trading symbol to get sentiment for (default: class default)
+            market_data: Market data to use for volatility calculation
             
         Returns:
             Dictionary with sentiment data
         """
-        symbol = symbol or self.default_pair
-        current_time = time.time()
-        
-        # Calculate dynamic TTL if market data is provided
-        if market_data is not None and not market_data.empty:
-            dynamic_ttl = self.calculate_dynamic_ttl(market_data)
-            if dynamic_ttl != self.sentiment_cache_ttl:
-                logger.info(f"Adjusting sentiment cache TTL from {self.sentiment_cache_ttl}s to {dynamic_ttl}s based on market conditions")
-                self.sentiment_cache_ttl = dynamic_ttl
-        
-        # Check if we have cached data that's still valid
-        if symbol in self.cached_sentiment_data and symbol in self.last_sentiment_update:
-            time_since_update = current_time - self.last_sentiment_update[symbol]
-            if time_since_update < self.sentiment_cache_ttl:
-                logger.info(f"Using cached sentiment data for {symbol} ({time_since_update:.0f}s old, TTL: {self.sentiment_cache_ttl}s)")
-                return self.cached_sentiment_data[symbol]
-            else:
-                logger.info(f"Cached sentiment data for {symbol} expired ({time_since_update:.0f}s old, TTL: {self.sentiment_cache_ttl}s)")
-        
-        # Extract base symbol (e.g., "ETH" from "ETH/USD")
-        base_symbol = symbol.split('/')[0] if '/' in symbol else symbol
+        # Use default symbol if not provided
+        if symbol is None:
+            symbol = self.default_pair
         
         try:
-            # Get news sentiment
-            finnhub_sentiment = self.apis['finnhub'].get_aggregate_sentiment(base_symbol)
-            
-            # Get on-chain metrics
-            coinlore_metrics = self.apis['coinlore'].get_on_chain_metrics(base_symbol)
-            
-            # Combine data
+            # Initialize empty result dictionary with default values
             sentiment_data = {
-                "symbol": symbol,
-                "sentiment_score": finnhub_sentiment.get('sentiment_score', 0),
-                "news_count": finnhub_sentiment.get('news_count', 0),
-                "market_cap_usd": coinlore_metrics.get('market_cap_usd', 0),
-                "volume_24h_usd": coinlore_metrics.get('volume_24h_usd', 0),
-                "percent_change_24h": coinlore_metrics.get('percent_change_24h', 0),
-                "percent_change_7d": coinlore_metrics.get('percent_change_7d', 0),
-                "timestamp": datetime.now().isoformat()
+                'sentiment_score': 0.0,
+                'news_count': 0,
+                'source': 'default',
+                'timestamp': datetime.now()
             }
             
-            # Update cache
-            self.cached_sentiment_data[symbol] = sentiment_data
-            self.last_sentiment_update[symbol] = current_time
+            # Check if we have a valid cache time and TTL
+            current_time = time.time()
+            last_cache_time = self.last_sentiment_cache_time.get(symbol, 0)
             
+            # Calculate a dynamic TTL based on market volatility if we have market data
+            sentiment_ttl = self.sentiment_data_ttl
+            if market_data is not None and not market_data.empty:
+                sentiment_ttl = self.calculate_dynamic_ttl(market_data)
+                
+            # If cache is still valid, get the real cached sentiment data instead of default
+            if current_time - last_cache_time < sentiment_ttl and hasattr(self, 'sentiment_cache'):
+                if symbol in getattr(self, 'sentiment_cache', {}):
+                    self.logger.info(f"Using cached sentiment data for {symbol} ({int(current_time - last_cache_time)}s old, TTL: {sentiment_ttl}s)")
+                    return self.sentiment_cache[symbol]
+                
+            # Try to get data from available APIs
+            tries = 0
+            max_tries = 3
+            api_data_found = False
+            
+            while tries < max_tries and not api_data_found:
+                try:
+                    # Try Finnhub API first if available
+                    if 'finnhub' in self.apis and self.apis['finnhub'] is not None:
+                        finnhub_data = self.apis['finnhub'].get_aggregate_sentiment(symbol)
+                        if finnhub_data and finnhub_data.get('sentiment_score', 0) != 0:
+                            sentiment_data['sentiment_score'] = finnhub_data.get('sentiment_score', 0)
+                            sentiment_data['news_count'] = finnhub_data.get('news_count', 0)
+                            sentiment_data['source'] = 'finnhub'
+                            api_data_found = True
+                            break
+                    
+                    # Try OpenAI API as fallback
+                    if not api_data_found and 'openai' in self.apis and self.apis['openai'] is not None:
+                        openai_data = self.apis['openai'].get_sentiment(symbol)
+                        if openai_data and openai_data.get('sentiment_score', 0) != 0:
+                            sentiment_data['sentiment_score'] = openai_data.get('sentiment_score', 0)
+                            sentiment_data['news_count'] = openai_data.get('news_count', 0)
+                            sentiment_data['source'] = 'openai'
+                            api_data_found = True
+                            break
+                    
+                    # Use fallback values if neither API works
+                    if not api_data_found:
+                        sentiment_data['sentiment_score'] = -0.1  # Slightly bearish default
+                        sentiment_data['news_count'] = 50  # Reasonable default
+                        sentiment_data['source'] = 'fallback'
+                        break
+                        
+                except Exception as inner_e:
+                    self.logger.error(f"Error in attempt {tries+1} for sentiment data: {str(inner_e)}")
+                    tries += 1
+                    time.sleep(0.5)  # Short delay before retry
+            
+            # Update cache timestamp and store the sentiment data
+            self.last_sentiment_cache_time[symbol] = current_time
+            
+            # Create sentiment_cache attribute if it doesn't exist
+            if not hasattr(self, 'sentiment_cache'):
+                self.sentiment_cache = {}
+                
+            # Store the new sentiment data in the cache
+            self.sentiment_cache[symbol] = sentiment_data
+            
+            # Return the sentiment data
             return sentiment_data
             
         except Exception as e:
-            logger.error(f"Error getting sentiment data: {e}")
-            
-            # Return cached data if available, even if expired
-            if symbol in self.cached_sentiment_data:
-                logger.warning(f"Returning expired cached sentiment data for {symbol} due to API error")
-                return self.cached_sentiment_data[symbol]
-                
-            # Return minimal data structure if no cached data
+            self.logger.error(f"Error getting sentiment data: {str(e)}")
+            # Always return a valid dictionary even on error
             return {
-                "symbol": symbol,
-                "sentiment_score": 0,
-                "timestamp": datetime.now().isoformat()
+                'sentiment_score': -0.1,  # Slightly bearish default
+                'news_count': 50,  # Reasonable default
+                'source': 'error_fallback',
+                'timestamp': datetime.now()
             }
     
     async def get_sentiment_data_async(self, symbol: str = None, market_data: Optional[pd.DataFrame] = None) -> Dict:
@@ -326,7 +444,7 @@ class TradingStrategy:
         try:
             if market_data.empty:
                 logger.warning("Cannot generate signals: Market data is empty")
-                return {"signal": 0, "signal_direction": "neutral", "strength": 0}
+                return {"signal": 0, "signal_direction": "neutral", "signal_strength": 0}
             
             logger.info("Generating signals for " + self.default_pair)
             
@@ -423,7 +541,7 @@ class TradingStrategy:
             signals = {
                 "signal": composite_signal,
                 "signal_direction": signal_direction,
-                "strength": signal_strength,
+                "signal_strength": signal_strength,
                 "timestamp": datetime.now().isoformat(),
                 "symbol": self.default_pair,
                 "components": {
@@ -457,7 +575,7 @@ class TradingStrategy:
             
         except Exception as e:
             logger.error(f"Error generating signals: {str(e)}", exc_info=True)
-            return {"signal": 0, "signal_direction": "neutral", "strength": 0}
+            return {"signal": 0, "signal_direction": "neutral", "signal_strength": 0}
     
     def should_trade(self, signals: Dict) -> bool:
         """
@@ -472,7 +590,7 @@ class TradingStrategy:
         # Extract the necessary values from signals
         signal = signals.get('signal', 0)
         signal_direction = signals.get('signal_direction', 'neutral')
-        signal_strength = signals.get('strength', 0)
+        signal_strength = signals.get('signal_strength', 0)
         trade_direction = signals.get('components', {}).get('direction', 'none')
         
         # Get min signal strength from config
@@ -511,58 +629,31 @@ class TradingStrategy:
                 position_qty = float(position.qty)
                 current_price = float(position.current_price)
                 position_value = position_qty * current_price
+                position_is_long = position_qty > 0
+                position_type = "LONG" if position_is_long else "SHORT"
+                
+                logger.info(f"Checking existing {position_type} position: {position_qty} {symbol} (value: ${abs(position_value):.2f})")
                 
                 # If we already have a position in the same direction, don't trade
-                if (signal_direction == 'buy' and position_qty > 0) or (signal_direction == 'sell' and position_qty < 0):
-                    logger.info(f"Already have a {signal_direction} position for {symbol} - skipping trade")
+                # Only skip if it's the same direction (long position and buy signal, or short position and sell signal)
+                if (signal_direction == 'buy' and position_is_long) or (signal_direction == 'sell' and not position_is_long):
+                    logger.info(f"Already have a {position_type} position for {symbol} matching the {signal_direction} signal - skipping trade")
                     return False
                 
-                # If position value is significant, consider closing it before opening opposite
+                # If position value is significant and signal is in opposite direction, we should trade to reverse the position
                 min_position_value = 10  # Minimum position value to consider
-                if position_value > min_position_value:
-                    # If signal is in opposite direction of current position
-                    if (signal_direction == 'buy' and position_qty < 0) or (signal_direction == 'sell' and position_qty > 0):
-                        # For now, just log this - actual position closure will be handled in execute_trade
-                        logger.info(f"Signal {signal_direction} is opposite to current position - will close existing position first")
+                if abs(position_value) > min_position_value:
+                    # If signal is in opposite direction of current position, we should trade
+                    if (signal_direction == 'buy' and not position_is_long) or (signal_direction == 'sell' and position_is_long):
+                        logger.info(f"Signal {signal_direction} is opposite to current {position_type} position - will execute trade to reverse position")
+                        return True
+                
         except Exception as e:
             error_message = str(e).lower()
             if "position does not exist" not in error_message:
                 logger.warning(f"Error checking position for {symbol}: {str(e)}")
-        
-        # Check account status
-        try:
-            account = self.apis['alpaca'].get_account()
-            if account.status != 'ACTIVE':
-                logger.warning(f"Account is not active (status: {account.status}) - no trading")
-                return False
-                
-            # Check buying power
-            buying_power = float(account.buying_power)
-            min_buying_power = self.config.get('trading', {}).get('min_buying_power', 10)
-            
-            # For buy signals with extremely low buying power, implement a higher threshold 
-            # to prevent constant failed attempts
-            if signal_direction == 'buy':
-                # With $15 or less buying power, require stronger signals to even attempt trading
-                if buying_power <= 15:
-                    min_signal_strength = 0.6  # Require a very strong signal (60%+)
-                    if signal_strength < min_signal_strength:
-                        logger.warning(f"Buying power is extremely low (${buying_power:.2f}). Requiring stronger signal (>{min_signal_strength})")
-                        return False
-                    
-                # With any buying power under $50, require at least a moderate signal
-                elif buying_power < 50:
-                    min_signal_strength = 0.4  # Require a moderate signal (40%+)
-                    if signal_strength < min_signal_strength:
-                        logger.warning(f"Buying power is low (${buying_power:.2f}). Requiring stronger signal (>{min_signal_strength})")
-                        return False
-            
-            if buying_power < min_buying_power:
-                logger.warning(f"Insufficient buying power (${buying_power:.2f} < ${min_buying_power}) - no trading")
-                return False
-        except Exception as e:
-            logger.warning(f"Error checking account status: {str(e)}")
-            return False
+            else:
+                logger.info(f"No existing position for {symbol} - will proceed if signal is strong enough")
         
         # If we got this far, we should trade
         logger.warning(f"Trade opportunity detected: {signal_direction} with strength {signal_strength:.4f}")
@@ -614,6 +705,7 @@ class TradingStrategy:
             existing_position_value = 0
             existing_avg_entry = 0
             existing_current_price = 0
+            position_is_long = False
             
             try:
                 # Get detailed position information
@@ -624,21 +716,53 @@ class TradingStrategy:
                     existing_position_value = float(position.market_value)
                     existing_avg_entry = float(position.avg_entry_price) if hasattr(position, 'avg_entry_price') else 0
                     existing_current_price = float(position.current_price) if hasattr(position, 'current_price') else 0
+                    position_is_long = existing_position_size > 0
                     
                     # Calculate what percentage of portfolio this position represents
                     portfolio_allocation = existing_position_value / portfolio_value * 100 if portfolio_value > 0 else 0
                     
-                    logger.info(f"Existing position found: {existing_position_size} {symbol} at avg entry ${existing_avg_entry:.2f}")
+                    position_type = "LONG" if position_is_long else "SHORT"
+                    logger.info(f"Existing {position_type} position found: {existing_position_size} {symbol} at avg entry ${existing_avg_entry:.2f}")
                     logger.info(f"Position value: ${existing_position_value:.2f} ({portfolio_allocation:.1f}% of portfolio)")
                     
-                    # If we already have a significant position in the same direction, don't add more
-                    if side == 'buy' and existing_position_size > 0:
-                        # If position already exceeds 90% of portfolio, don't add more
-                        if portfolio_allocation > 90:
-                            logger.warning(f"Position already represents {portfolio_allocation:.1f}% of portfolio - skipping additional buy.")
+                    # Check if we need to close the existing position first due to opposite signal
+                    need_to_close_first = (side == 'buy' and not position_is_long) or (side == 'sell' and position_is_long)
+                    
+                    if need_to_close_first:
+                        close_side = 'buy' if not position_is_long else 'sell'
+                        logger.info(f"Closing existing {position_type} position before opening new {'LONG' if side == 'buy' else 'SHORT'} position")
+                        
+                        # Close the existing position with a market order
+                        close_order = self.order_manager.execute_trade(
+                            symbol=symbol,
+                            side=close_side,
+                            qty=abs(existing_position_size),
+                            order_type="market"
+                        )
+                        
+                        if close_order.get('error'):
+                            logger.error(f"Failed to close existing position: {close_order.get('error')}")
                             return {
                                 "executed": False,
-                                "error": f"Position already represents {portfolio_allocation:.1f}% of portfolio - buying more would be too concentrated."
+                                "error": f"Failed to close existing position: {close_order.get('error')}"
+                            }
+                        
+                        logger.info(f"Position closed: {close_order}")
+                        
+                        # Small delay to ensure the close order is processed
+                        time.sleep(0.5)
+                        
+                        # Reset position flags since we've closed it
+                        has_existing_position = False
+                        existing_position_size = 0
+                        existing_position_value = 0
+                    elif (side == 'buy' and position_is_long) or (side == 'sell' and not position_is_long):
+                        # If we already have a position in the same direction with significant allocation, don't add more
+                        if portfolio_allocation > 90:
+                            logger.warning(f"Position already represents {portfolio_allocation:.1f}% of portfolio - skipping additional {side}.")
+                            return {
+                                "executed": False,
+                                "error": f"Position already represents {portfolio_allocation:.1f}% of portfolio - adding more would be too concentrated."
                             }
             except Exception as e:
                 error_msg = str(e).lower()
@@ -648,12 +772,13 @@ class TradingStrategy:
                 else:
                     logger.warning(f"Error checking existing position: {str(e)}")
             
-            # Use available buying power for buy orders and respect position sizing limits
+            # Use available buying power for orders and respect position sizing limits
+            # For buy (long) orders
             if side == 'buy':
                 # Ensure we use no more than available buying power
                 position_sizing_balance = available_balance
-                # Additional safety buffer (5% below available)
-                safe_buy_amount = position_sizing_balance * 0.95
+                # Add more conservative safety buffer (10% below available)
+                safe_buy_amount = position_sizing_balance * 0.9
                 
                 # For extremely low buying power, use an even more conservative approach
                 if position_sizing_balance < 100:
@@ -663,8 +788,8 @@ class TradingStrategy:
                 
                 logger.info(f"Using buy amount of ${safe_buy_amount:.2f} (from buying power ${position_sizing_balance:.2f})")
             else:
-                # For sells, check if we have an existing position
-                if has_existing_position and existing_position_size > 0:
+                # For sell (short) orders
+                if has_existing_position and position_is_long:
                     # This is closing an existing long position
                     position_sizing_balance = existing_position_value
                     safe_buy_amount = position_sizing_balance
@@ -675,8 +800,8 @@ class TradingStrategy:
                     
                     # Use position sizing similar to buy orders but for shorts
                     position_sizing_balance = available_balance
-                    # Additional safety buffer (5% below available)
-                    safe_buy_amount = position_sizing_balance * 0.95
+                    # Add more conservative safety buffer (10% below available)
+                    safe_buy_amount = position_sizing_balance * 0.9
                     
                     # For extremely low buying power, use an even more conservative approach
                     if position_sizing_balance < 100:
@@ -689,9 +814,6 @@ class TradingStrategy:
             # Check if user settings are available (look for a state file)
             strategy_mode = "Moderate"  # Default value
             try:
-                import os
-                import json
-                
                 state_file = 'config/app_state.json'
                 if os.path.exists(state_file):
                     with open(state_file, 'r') as f:
@@ -707,6 +829,8 @@ class TradingStrategy:
                 price = signals.get('entry_point')
             elif signals.get('price'):
                 price = signals.get('price')
+            elif signals.get('current_price'):
+                price = signals.get('current_price')
             else:
                 # Get current price from websocket if available
                 if hasattr(self.apis['alpaca'], 'get_current_price'):
@@ -724,11 +848,12 @@ class TradingStrategy:
                     "error": "Could not determine current price"
                 }
             
-            # Calculate position size in quantity 
-            # For buys, use safe_buy_amount / price
-            # For sells, use existing position size if closing, or calculate new position size if shorting
+            # Calculate position size in quantity
             if side == 'buy':
-                position_size = safe_buy_amount / price
+                # Long position
+                # Add a safety margin to account for potential price fluctuations
+                adjusted_price = price * 1.005  # Add 0.5% buffer for potential price fluctuations
+                position_size = safe_buy_amount / adjusted_price
                 
                 # Make sure the position size is not too small
                 if position_size * price < 10 and position_size * price < safe_buy_amount * 0.9:
@@ -738,13 +863,14 @@ class TradingStrategy:
                         "error": f"Position value (${position_size * price:.2f}) is below minimum threshold of $10"
                     }
             else:
-                # For sells, check if we're closing an existing position or opening a short
-                if has_existing_position and existing_position_size > 0:
+                # Short position or close long
+                if has_existing_position and position_is_long:
                     # Closing an existing long position
                     position_size = existing_position_size
                 else:
                     # Opening a new short position
-                    position_size = safe_buy_amount / price
+                    adjusted_price = price * 0.995  # Subtract 0.5% buffer for potential price fluctuations
+                    position_size = safe_buy_amount / adjusted_price
                     
                     # Make sure the position size is not too small
                     if position_size * price < 10 and position_size * price < safe_buy_amount * 0.9:
@@ -758,45 +884,109 @@ class TradingStrategy:
             if side == 'buy':
                 logger.info(f"Buy position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
             else:
-                if has_existing_position and existing_position_size > 0:
+                if has_existing_position and position_is_long:
                     logger.info(f"Sell existing long position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
                 else:
                     logger.info(f"Open short position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
             
             logger.info(f"Strategy mode: {strategy_mode}")
             
-            # Execute the order
-            order = self.order_manager.execute_trade(
-                symbol=symbol,
-                side=side,
-                qty=position_size,
-                order_type="market"
-            )
+            # Try to execute the order, with retry logic for size issues
+            order = None
+            max_retries = 3
+            retry_count = 0
+            current_position_size = position_size
             
-            # Update last trade time
+            while retry_count < max_retries:
+                try:
+                    # Execute the order
+                    order = self.order_manager.execute_trade(
+                        symbol=symbol,
+                        side=side,
+                        qty=current_position_size,
+                        order_type="market"
+                    )
+                    
+                    # Check if the order was rejected
+                    if order.get('status') == 'rejected' or order.get('error'):
+                        error_msg = order.get('error', 'Unknown error')
+                        
+                        # Check if it's an insufficient buying power error
+                        if 'insufficient' in error_msg.lower() and retry_count < max_retries - 1:
+                            # Reduce position size by 15% and try again
+                            retry_count += 1
+                            current_position_size *= 0.85
+                            logger.warning(f"Retrying with reduced position size: {current_position_size:.6f} (attempt {retry_count}/{max_retries})")
+                            continue
+                        else:
+                            # Non-retryable error or out of retries
+                            logger.error(f"Order rejected: {error_msg}")
+                            return {
+                                "executed": False,
+                                "error": error_msg,
+                                "attempted_qty": current_position_size,
+                                "price": price
+                            }
+                    else:
+                        # Order accepted, break out of retry loop
+                        break
+                    
+                except Exception as e:
+                    # Handle unexpected exceptions
+                    error_message = str(e)
+                    logger.error(f"Unexpected error executing trade: {error_message}")
+                    
+                    # Check if it might be a sizing issue we can retry
+                    if 'insufficient' in error_message.lower() and retry_count < max_retries - 1:
+                        retry_count += 1
+                        current_position_size *= 0.85
+                        logger.warning(f"Error suggests sizing issue. Retrying with reduced size: {current_position_size:.6f} (attempt {retry_count}/{max_retries})")
+                        continue
+                    else:
+                        # Non-retryable error or out of retries
+                        return {
+                            "executed": False,
+                            "error": f"Trade execution error: {error_message}",
+                            "attempted_qty": current_position_size,
+                            "price": price
+                        }
+            
+            # Check if the order was successful
+            if not order or order.get('status') == 'rejected' or order.get('error'):
+                error_msg = order.get('error', 'Unknown error') if order else "Failed to place order"
+                logger.error(f"Trade execution failed: {error_msg}")
+                return {
+                    "executed": False,
+                    "error": error_msg,
+                    "attempted_qty": current_position_size,
+                    "price": price
+                }
+            
+            # Update last trade time ONLY on successful orders
             self.last_trade_time = datetime.now()
             
             # Log the executed trade with specific action type
             if side == 'buy':
                 trade_action = "BUY (LONG)"
             else:
-                if has_existing_position and existing_position_size > 0:
+                if has_existing_position and position_is_long:
                     trade_action = "SELL (CLOSE LONG)"
                 else:
                     trade_action = "SELL (SHORT)"
-                
-            logger.info(f"Trade executed: {trade_action} {position_size} {symbol} at ~${price:.2f}")
+            
+            logger.info(f"Trade executed: {trade_action} {current_position_size} {symbol} at ~${price:.2f}")
             
             return {
                 "executed": True,
                 "trade": order,
                 "side": side,
                 "direction": trade_direction,
-                "qty": position_size,
+                "qty": current_position_size,
                 "price": price,
                 "symbol": symbol,
                 "timestamp": datetime.now().isoformat(),
-                "strategy_mode": strategy_mode
+                "strategy_mode": strategy_mode,
+                "order_id": order.get('id', 'unknown')
             }
             
         except Exception as e:
@@ -855,31 +1045,91 @@ class TradingStrategy:
             if current_price:
                 signals['current_price'] = current_price
             
+            # Ensure signal strength is consistently reported
+            signal_strength = signals.get('signal_strength', 0)
+            signal_direction = signals.get('signal_direction', 'none')
+            
             # Check if we should trade
             should_trade = self.should_trade(signals)
             
             # Execute trade if conditions are met
             trade_result = None
+            trade_status = "no_trade"
+            trade_message = "No trade executed"
+            trade_qty = 0
+            trade_price = current_price or 0
+            order_id = "none"
+            
             if should_trade:
                 logger.info(f"[{cycle_id}] Trade conditions met for {symbol}, proceeding with execution")
                 trade_result = self.execute_trade(signals, symbol)
+                
+                # Process and record trade outcome
+                if trade_result.get('executed', False):
+                    trade_status = "executed"
+                    trade_message = f"Trade executed: {trade_result.get('side', 'unknown')} {trade_result.get('qty', 0)} {symbol}"
+                    trade_qty = trade_result.get('qty', 0)
+                    trade_price = trade_result.get('price', current_price or 0)
+                    order_id = trade_result.get('order_id', 'unknown')
+                    
+                    # Record successful trade in log with clear details
+                    logger.info(f"[{cycle_id}] {trade_message} at ${trade_price:.2f}, Order ID: {order_id}")
+                else:
+                    # Trade was attempted but failed
+                    trade_status = "failed"
+                    error_message = trade_result.get('error', 'Unknown error')
+                    trade_message = f"Trade failed: {error_message}"
+                    trade_qty = trade_result.get('attempted_qty', 0)
+                    
+                    # Log failed trade clearly
+                    logger.warning(f"[{cycle_id}] {trade_message}")
             else:
                 logger.info(f"[{cycle_id}] Trade conditions not met for {symbol}, skipping execution")
+                logger.info(f"[{cycle_id}] No trade executed, continuing to monitor markets")
             
             # Calculate cycle duration
             cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
             logger.info(f"[{cycle_id}] Async trading cycle completed in {cycle_duration:.2f}s for {symbol}")
             
-            return {
+            # Create cycle result with consistent signal information
+            cycle_result = {
                 "timestamp": datetime.now().isoformat(),
                 "symbol": symbol,
                 "timeframe": timeframe,
+                "current_price": current_price or (market_data['close'].iloc[-1] if not market_data.empty else 0),
                 "signals": signals,
+                "signal_strength": signal_strength,
+                "signal_direction": signal_direction,
                 "should_trade": should_trade,
                 "trade_result": trade_result,
+                "trade_status": trade_status,
+                "trade_message": trade_message,
+                "trade_qty": trade_qty,
+                "trade_price": trade_price,
+                "order_id": order_id,
                 "cycle_id": cycle_id,
                 "duration_seconds": cycle_duration
             }
+            
+            # Append additional logging for debugging (similar to non-async version)
+            logger.info(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Completed trading cycle")
+            logger.info(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Current {symbol} price: {cycle_result['current_price']}")
+            logger.info(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Strategy is looking for a {signal_direction.upper()} opportunity")
+            logger.info(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Signal: {signal_direction} ({signal_strength:.4f}), Direction: {signals.get('components', {}).get('direction', 'unknown')}, Strength: {signal_strength:.4f}")
+            
+            if should_trade:
+                if trade_status == "executed":
+                    logger.info(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trade executed: {trade_result.get('side')} {trade_qty} {symbol} at ${trade_price:.2f}, Order ID: {order_id}")
+                else:
+                    error_message = trade_result.get('error', 'Unknown error') if trade_result else 'Unknown error'
+                    logger.warning(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trade opportunity detected: {signal_direction} with strength {signal_strength:.4f}")
+                    logger.warning(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trade failed: {error_message}")
+            else:
+                logger.info(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] No trade executed, continuing to monitor markets")
+                
+            logger.info(f"[{cycle_id}-ASYNC-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trading cycle completed in {cycle_duration:.2f} seconds.")
+            
+            return cycle_result
             
         except Exception as e:
             cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
@@ -890,7 +1140,8 @@ class TradingStrategy:
                 "timeframe": timeframe,
                 "error": str(e),
                 "cycle_id": cycle_id,
-                "duration_seconds": cycle_duration
+                "duration_seconds": cycle_duration,
+                "trade_status": "error"
             }
     
     def run_trading_cycle(self, symbol: str = None, timeframe: str = None) -> Dict:
@@ -942,6 +1193,10 @@ class TradingStrategy:
             if current_price:
                 signals['current_price'] = current_price
             
+            # Ensure signal strength is consistently reported
+            signal_strength = signals.get('signal_strength', 0)
+            signal_direction = signals.get('signal_direction', 'none')
+            
             # Check if we should trade
             should_trade = self.should_trade(signals)
             if should_trade:
@@ -951,23 +1206,81 @@ class TradingStrategy:
             
             # Execute trade if conditions are met
             trade_result = None
+            trade_status = "no_trade"
+            trade_message = "No trade executed"
+            trade_qty = 0
+            trade_price = current_price or 0
+            order_id = "none"
+            
             if should_trade:
                 trade_result = self.execute_trade(signals, symbol)
+                
+                # Process and record trade outcome
+                if trade_result.get('executed', False):
+                    trade_status = "executed"
+                    trade_message = f"Trade executed: {trade_result.get('side', 'unknown')} {trade_result.get('qty', 0)} {symbol}"
+                    trade_qty = trade_result.get('qty', 0)
+                    trade_price = trade_result.get('price', current_price or 0)
+                    order_id = trade_result.get('order_id', 'unknown')
+                    
+                    # Record successful trade in log with clear details
+                    logger.info(f"[{cycle_id}] {trade_message} at ${trade_price:.2f}, Order ID: {order_id}")
+                else:
+                    # Trade was attempted but failed
+                    trade_status = "failed"
+                    error_message = trade_result.get('error', 'Unknown error')
+                    trade_message = f"Trade failed: {error_message}"
+                    trade_qty = trade_result.get('attempted_qty', 0)
+                    
+                    # Log failed trade clearly
+                    logger.warning(f"[{cycle_id}] {trade_message}")
+            else:
+                # Log that no trade was executed
+                logger.info(f"[{cycle_id}] No trade executed, continuing to monitor markets")
             
             # Calculate cycle duration
             cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
             logger.info(f"[{cycle_id}] Trading cycle completed in {cycle_duration:.2f}s for {symbol}")
             
-            return {
+            # Create cycle result with consistent signal information
+            cycle_result = {
                 "timestamp": datetime.now().isoformat(),
                 "symbol": symbol,
                 "timeframe": timeframe,
+                "current_price": current_price or (market_data['close'].iloc[-1] if not market_data.empty else 0),
                 "signals": signals,
+                "signal_strength": signal_strength,
+                "signal_direction": signal_direction,
                 "should_trade": should_trade,
                 "trade_result": trade_result,
+                "trade_status": trade_status,
+                "trade_message": trade_message,
+                "trade_qty": trade_qty,
+                "trade_price": trade_price,
+                "order_id": order_id,
                 "cycle_id": cycle_id,
                 "duration_seconds": cycle_duration
             }
+            
+            # Append additional logging for debugging
+            logger.info(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Completed trading cycle")
+            logger.info(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Current {symbol} price: {cycle_result['current_price']}")
+            logger.info(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Strategy is looking for a {signal_direction.upper()} opportunity")
+            logger.info(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Signal: {signal_direction} ({signal_strength:.4f}), Direction: {signals.get('components', {}).get('direction', 'unknown')}, Strength: {signal_strength:.4f}")
+            
+            if should_trade:
+                if trade_status == "executed":
+                    logger.info(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trade executed: {trade_result.get('side')} {trade_qty} {symbol} at ${trade_price:.2f}, Order ID: {order_id}")
+                else:
+                    error_message = trade_result.get('error', 'Unknown error') if trade_result else 'Unknown error'
+                    logger.warning(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trade opportunity detected: {signal_direction} with strength {signal_strength:.4f}")
+                    logger.warning(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trade failed: {error_message}")
+            else:
+                logger.info(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] No trade executed, continuing to monitor markets")
+                
+            logger.info(f"[{cycle_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}] Trading cycle completed in {cycle_duration:.2f} seconds. Next check at {(datetime.now() + timedelta(seconds=15)).strftime('%H:%M:%S')}")
+            
+            return cycle_result
             
         except Exception as e:
             cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
@@ -978,7 +1291,8 @@ class TradingStrategy:
                 "timeframe": timeframe,
                 "error": str(e),
                 "cycle_id": cycle_id,
-                "duration_seconds": cycle_duration
+                "duration_seconds": cycle_duration,
+                "trade_status": "error"
             }
     
     def start_trading(self) -> bool:
@@ -1452,4 +1766,51 @@ class TradingStrategy:
                 
         except Exception as e:
             logger.error(f"Error calculating volume signal: {str(e)}")
-            return 0 
+            return 0
+    
+    def _initialize_websocket(self):
+        """Initialize the websocket connection for real-time market data"""
+        try:
+            # Check if websocket has already been initialized
+            if hasattr(self, 'ws_initialization_attempted') and self.ws_initialization_attempted:
+                self.logger.info("Websocket initialization already attempted, skipping redundant initialization")
+                return
+            
+            # Mark as attempted
+            self.ws_initialization_attempted = True
+            
+            self.logger.info(f"Initializing websocket for {self.default_pair}")
+            
+            # Get all crypto pairs we might trade
+            supported_pairs = self.config.get('trading', {}).get(
+                'supported_pairs', 
+                ['ETH/USD', 'BTC/USD', 'LTC/USD', 'BCH/USD', 'XRP/USD']
+            )
+            
+            # Make sure default pair is included
+            if self.default_pair not in supported_pairs:
+                supported_pairs.append(self.default_pair)
+            
+            websocket_started = self.apis['alpaca'].start_websocket(
+                symbols=supported_pairs, 
+                timeout=5.0,
+                non_blocking=True
+            )
+            
+            if websocket_started:
+                self.logger.info(f"Websocket initialized successfully for {supported_pairs}")
+            else:
+                self.logger.warning(f"Failed to initialize websocket for {supported_pairs}. Will use REST API.")
+        except Exception as e:
+            self.logger.error(f"Error initializing websocket: {e}")
+            self.logger.warning("Will use REST API for market data.")
+    
+    def cleanup(self):
+        """Cleanup resources like websocket connections"""
+        try:
+            # Stop the websocket connection if it exists
+            if hasattr(self.apis['alpaca'], 'stop_websocket'):
+                self.logger.info("Stopping websocket connection")
+                self.apis['alpaca'].stop_websocket()
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}") 

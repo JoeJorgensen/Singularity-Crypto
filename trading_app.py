@@ -12,9 +12,13 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
-from streamlit_autorefresh import st_autorefresh
 from dotenv import load_dotenv
 from typing import Dict, Optional
+import atexit
+# Add imports for script context management
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+# Import streamlit_autorefresh for real-time UI updates
+from streamlit_autorefresh import st_autorefresh
 
 # Import core components
 from trading_strategy import TradingStrategy
@@ -253,7 +257,15 @@ def load_persistent_state():
 # Initialize session state
 if 'initialized' not in st.session_state:
     st.session_state.initialized = False
-
+    
+if 'update_thread' not in st.session_state:
+    st.session_state.update_thread = None
+    
+# Important: Initialize these early to avoid errors in background threads
+st.session_state.update_thread_running = False
+st.session_state.last_update_time = None
+st.session_state.trigger_update = False
+    
 if not st.session_state.initialized:
     # Load persistent state first
     persistent_state = load_persistent_state()
@@ -288,6 +300,175 @@ if not st.session_state.initialized:
     st.session_state.initialized = True
     logger.info("Application session initialized with persistent state")
 
+# Function to update data in background without refreshing the entire page
+def background_update():
+    """Background function to update data periodically."""
+    try:
+        # Initialize the update_thread_running attribute if it doesn't exist
+        if not hasattr(st.session_state, "update_thread_running"):
+            st.session_state.update_thread_running = True
+            
+        while getattr(st.session_state, "update_thread_running", True):
+            try:
+                # Store current time
+                current_time = time.time()
+                st.session_state.last_update_time = current_time
+                
+                # Only run trading cycles if trading is active
+                if hasattr(st.session_state, "initialized") and getattr(st.session_state, "trading_active", False):
+                    logger.info("Background update thread running trading cycle")
+                    
+                    # Set trigger update flag to ensure UI updates
+                    st.session_state.trigger_update = True
+                    
+                    # Get system components
+                    if 'system' in st.session_state:
+                        trading_strategy = st.session_state.system.get('trading_strategy')
+                        
+                        # Get normalized timeframe for consistent handling
+                        selected_tf = st.session_state.selected_timeframe
+                        norm_tf = normalize_timeframe(selected_tf)
+                        
+                        # Run the trading cycle directly
+                        # We're running this in the background thread to ensure it happens
+                        # even when user is not actively viewing the page
+                        try:
+                            # Generate a unique cycle ID for this run
+                            cycle_id = f"BGUpdateCycle-{int(time.time())}"
+                            
+                            # Check if another cycle is currently running for this symbol/timeframe
+                            cycle_lock_key = f"{norm_tf}"
+                            
+                            # Initialize cycle lock if not exists
+                            if cycle_lock_key not in st.session_state.cycle_locks:
+                                st.session_state.cycle_locks[cycle_lock_key] = {
+                                    "running": False,
+                                    "last_run": None
+                                }
+                            
+                            # Skip if another cycle is already running
+                            if st.session_state.cycle_locks[cycle_lock_key]["running"]:
+                                time_diff = (datetime.now() - st.session_state.cycle_locks[cycle_lock_key]["last_run"]).total_seconds() if st.session_state.cycle_locks[cycle_lock_key]["last_run"] else 999
+                                # If another cycle has been running for more than 30 seconds, consider it stalled
+                                if time_diff < 30:
+                                    logger.info(f"[{cycle_id}] Skipping trading cycle - another one is already running ({time_diff:.1f}s ago)")
+                                    continue
+                                else:
+                                    logger.warning(f"[{cycle_id}] Found stalled trading cycle ({time_diff:.1f}s old), resetting lock")
+                            
+                            # Mark this cycle as running
+                            st.session_state.cycle_locks[cycle_lock_key]["running"] = True
+                            
+                            # Run the trading cycle
+                            cycle_result = trading_strategy.run_trading_cycle(symbol=st.session_state.default_trading_pair, timeframe=norm_tf)
+                            
+                            # Process the results and update UI data
+                            _process_trading_cycle_results(cycle_id, cycle_result, st.session_state.default_trading_pair, datetime.now())
+                            
+                            # Set a flag to indicate that new data is available for UI refresh
+                            st.session_state.data_updated = True
+                            
+                        except Exception as e:
+                            logger.error(f"Error in background trading cycle: {str(e)}", exc_info=True)
+                        finally:
+                            # Mark the cycle as no longer running
+                            if cycle_lock_key in st.session_state.cycle_locks:
+                                st.session_state.cycle_locks[cycle_lock_key]["running"] = False
+                                st.session_state.cycle_locks[cycle_lock_key]["last_run"] = datetime.now()
+                    else:
+                        logger.warning("Cannot run background trading cycle - system not initialized")
+                
+                # Sleep for the specified interval
+                interval = getattr(st.session_state, "refresh_interval", 15)  # Default to 15 seconds
+                time.sleep(interval)
+            except Exception as e:
+                logger.error(f"Error in background update thread: {e}")
+                time.sleep(5)  # Wait a bit before retrying on error
+    except Exception as e:
+        logger.error(f"Fatal error in background update thread: {e}")
+
+# Start the background update thread if it's not already running
+def ensure_update_thread():
+    """Ensure the background update thread is running."""
+    # Initialize thread-related attributes if they don't exist
+    if not hasattr(st.session_state, "update_thread"):
+        st.session_state.update_thread = None
+        
+    if not hasattr(st.session_state, "update_thread_running"):
+        st.session_state.update_thread_running = False
+    
+    # Check if thread is running, start it if not
+    if (not st.session_state.update_thread or 
+            not getattr(st.session_state.update_thread, "is_alive", lambda: False)()):
+        
+        st.session_state.update_thread_running = True
+        thread = threading.Thread(
+            target=background_update, 
+            daemon=True
+        )
+        # Store the script run context and add it to the thread
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            add_script_run_ctx(thread, ctx)
+        
+        # Start the thread and store it in session state
+        thread.start()
+        st.session_state.update_thread = thread
+        logger.info("Started background update thread with script context")
+
+# Add cleanup function after ensure_update_thread function
+def cleanup():
+    """Clean up resources when application exits."""
+    logger.info("Running cleanup...")
+    
+    # Stop background update thread
+    if hasattr(st.session_state, "update_thread_running"):
+        st.session_state.update_thread_running = False
+        logger.info("Stopped background update thread")
+        
+        # If thread exists, try to join it with a timeout
+        if hasattr(st.session_state, "update_thread") and st.session_state.update_thread is not None:
+            try:
+                st.session_state.update_thread.join(timeout=1.0)
+                logger.info("Background thread joined successfully")
+            except Exception as e:
+                logger.error(f"Error joining background thread: {e}")
+    
+    # Stop any websocket connections
+    try:
+        if 'system' in st.session_state and 'apis' in st.session_state.system and 'alpaca' in st.session_state.system['apis']:
+            alpaca_api = st.session_state.system['apis']['alpaca']
+            alpaca_api.stop_websocket()
+            logger.info("Stopped Alpaca websocket connection")
+    except Exception as e:
+        logger.error(f"Error stopping websocket: {e}")
+    
+    # Close any event loops that might be open - safely
+    try:
+        # Check if we're in a thread with an event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                logger.info("Stopping running event loop")
+                loop.stop()
+            
+            # Only close if not already closed and we're in the main thread
+            # Closing loops in daemon threads can cause issues
+            if not loop.is_closed() and threading.current_thread() is threading.main_thread():
+                logger.info("Closing event loop in main thread")
+                loop.close()
+                logger.info("Closed asyncio event loop")
+        except RuntimeError:
+            # No event loop in this thread, which is fine
+            logger.info("No current event loop in this thread during cleanup")
+    except Exception as e:
+        logger.error(f"Error closing event loop: {e}")
+    
+    logger.info("Cleanup completed")
+
+# Register cleanup function to run at exit
+atexit.register(cleanup)
+
 # Load configuration
 @st.cache_resource(ttl=1)
 def load_config():
@@ -307,44 +488,115 @@ def load_config():
         merged_config = main_config.copy()
         for key, value in trading_config.items():
             merged_config[key] = value
+        
+        # Add API credentials from environment or secrets
+        merged_config = add_api_credentials_to_config(merged_config)
             
         return merged_config
     except Exception as e:
         logger.error(f"Error loading configuration: {str(e)}")
         # Fallback to just main config if error occurs
         with open('config/config.json', 'r') as f:
-            return json.load(f)
+            config = json.load(f)
+            return add_api_credentials_to_config(config)
+
+def add_api_credentials_to_config(config):
+    """Add API credentials from environment or secrets to config."""
+    # Print available keys in st.secrets for debugging
+    logger.info(f"Available st.secrets keys: {list(st.secrets.keys() if hasattr(st.secrets, 'keys') else [])}")
+    
+    # Try to get API keys from Streamlit secrets first (nested in alpaca section)
+    if 'alpaca' in st.secrets:
+        logger.info(f"alpaca section keys: {list(st.secrets.alpaca.keys() if hasattr(st.secrets.alpaca, 'keys') else [])}")
+        
+        if 'ALPACA_API_KEY' in st.secrets.alpaca and 'ALPACA_API_SECRET' in st.secrets.alpaca:
+            config['ALPACA_API_KEY'] = st.secrets.alpaca['ALPACA_API_KEY']
+            config['ALPACA_API_SECRET'] = st.secrets.alpaca['ALPACA_API_SECRET']
+            logger.info(f"Added API credentials from Streamlit secrets (alpaca section): Key length={len(config['ALPACA_API_KEY'])}, Secret length={len(config['ALPACA_API_SECRET'])}")
+        elif 'api_key' in st.secrets.alpaca and 'api_secret' in st.secrets.alpaca:
+            # Try lowercase versions
+            config['ALPACA_API_KEY'] = st.secrets.alpaca['api_key']
+            config['ALPACA_API_SECRET'] = st.secrets.alpaca['api_secret']
+            logger.info(f"Added API credentials from Streamlit secrets (alpaca section, lowercase): Key length={len(config['ALPACA_API_KEY'])}, Secret length={len(config['ALPACA_API_SECRET'])}")
+    # Try to get API keys from Streamlit secrets (top level)
+    elif 'ALPACA_API_KEY' in st.secrets and 'ALPACA_API_SECRET' in st.secrets:
+        config['ALPACA_API_KEY'] = st.secrets['ALPACA_API_KEY']
+        config['ALPACA_API_SECRET'] = st.secrets['ALPACA_API_SECRET']
+        logger.info("Added API credentials from Streamlit secrets (top level)")
+    # Try to get API keys from environment variables
+    elif os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET'):
+        config['ALPACA_API_KEY'] = os.getenv('ALPACA_API_KEY')
+        config['ALPACA_API_SECRET'] = os.getenv('ALPACA_API_SECRET')
+        logger.info("Added API credentials from environment variables")
+    else:
+        logger.warning("No API credentials found in Streamlit secrets or environment variables")
+    
+    return config
 
 # Initialize trading system
 @st.cache_resource
 def initialize_trading_system(config):
     """Initialize all components of the trading system."""
-    # Initialize trading strategy (this will initialize all APIs)
-    trading_strategy = TradingStrategy(config)
+    logger.info("Starting trading system initialization...")
     
-    # Get API references from the trading strategy
-    apis = trading_strategy.apis
-    
-    # Initialize components that might not be initialized by TradingStrategy
-    risk_manager = RiskManager(config)
-    position_calculator = PositionCalculator(risk_manager, config)
-    signal_aggregator = SignalAggregator(config)
-    order_manager = OrderManager(apis['alpaca'], config)
-    
-    # Initialize is_active flag on the trading strategy based on persistent state
-    # This function is called after session state is initialized, so we can use it here
-    if 'trading_active' in st.session_state and st.session_state.trading_active:
-        trading_strategy.start_trading()
-        logger.info("Trading strategy activated based on persistent state")
-    
-    return {
-        'trading_strategy': trading_strategy,
-        'risk_manager': risk_manager,
-        'position_calculator': position_calculator,
-        'signal_aggregator': signal_aggregator,
-        'order_manager': order_manager,
-        'apis': apis
-    }
+    try:
+        # Set a timeout for initialization
+        MAX_INIT_TIME = 15  # seconds
+        init_start_time = time.time()
+        
+        # Initialize trading strategy (this will initialize all APIs)
+        logger.info("Initializing trading strategy...")
+        trading_strategy = TradingStrategy(config)
+        logger.info(f"Trading strategy initialized in {time.time() - init_start_time:.2f} seconds")
+        
+        # Check if we've exceeded our timeout
+        if time.time() - init_start_time > MAX_INIT_TIME:
+            logger.warning("Initialization taking too long, continuing with partial initialization")
+        
+        # Get API references from the trading strategy
+        apis = trading_strategy.apis
+        logger.info("Got API references")
+        
+        # Initialize components that might not be initialized by TradingStrategy
+        logger.info("Initializing risk manager...")
+        risk_manager = RiskManager(config)
+        
+        logger.info("Initializing position calculator...")
+        position_calculator = PositionCalculator(risk_manager, config)
+        
+        logger.info("Initializing signal aggregator...")
+        signal_aggregator = SignalAggregator(config)
+        
+        logger.info("Initializing order manager...")
+        order_manager = OrderManager(apis['alpaca'], config)
+        
+        # Initialize is_active flag on the trading strategy based on persistent state
+        # This function is called after session state is initialized, so we can use it here
+        if 'trading_active' in st.session_state and st.session_state.trading_active:
+            logger.info("Activating trading strategy based on persistent state")
+            trading_strategy.start_trading()
+            logger.info("Trading strategy activated based on persistent state")
+        
+        logger.info(f"Trading system fully initialized in {time.time() - init_start_time:.2f} seconds")
+        return {
+            'trading_strategy': trading_strategy,
+            'risk_manager': risk_manager,
+            'position_calculator': position_calculator,
+            'signal_aggregator': signal_aggregator,
+            'order_manager': order_manager,
+            'apis': apis
+        }
+    except Exception as e:
+        logger.error(f"Error during trading system initialization: {str(e)}", exc_info=True)
+        # Return a minimal system to prevent complete app failure
+        return {
+            'trading_strategy': None,
+            'risk_manager': RiskManager(config),
+            'position_calculator': None,
+            'signal_aggregator': None,
+            'order_manager': None,
+            'apis': {}
+        }
 
 def normalize_timeframe(timeframe):
     """Normalize timeframe string for API compatibility."""
@@ -404,121 +656,12 @@ def run_trading_cycle_with_stats(trading_strategy, timeframe, symbol='ETH/USD'):
         st.session_state.trading_stats["last_check"] = cycle_start_time
         logger.info(f"[{cycle_id}] Starting trading cycle for {symbol} on {norm_timeframe} timeframe")
         
-        # Run the trading cycle (preferring async version if available)
-        if hasattr(trading_strategy, 'run_trading_cycle_async'):
-            # Create an event loop in the current thread if one doesn't exist
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            # Run the async cycle
-            cycle_result = loop.run_until_complete(trading_strategy.run_trading_cycle_async(symbol, norm_timeframe))
-            logger.info(f"[{cycle_id}] Completed async trading cycle")
-        else:
-            # Fall back to synchronous version
-            cycle_result = trading_strategy.run_trading_cycle(symbol, norm_timeframe)
-            logger.info(f"[{cycle_id}] Completed synchronous trading cycle")
+        # Use only the synchronous version for simplicity and reliability
+        cycle_result = trading_strategy.run_trading_cycle(symbol, norm_timeframe)
+        logger.info(f"[{cycle_id}] Completed trading cycle")
         
-        # Update current price if available
-        if 'signals' in cycle_result and cycle_result['signals']:
-            if 'current_price' in cycle_result['signals']:
-                current_price = cycle_result['signals']['current_price']
-                st.session_state.trading_stats["current_price"] = current_price
-                logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
-            elif hasattr(cycle_result['signals'], 'get') and cycle_result['signals'].get('entry_point'):
-                current_price = cycle_result['signals']['entry_point']
-                st.session_state.trading_stats["current_price"] = current_price
-                logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
-        
-        # Update stats
-        st.session_state.trading_stats["cycles_completed"] += 1
-        
-        # Update current_status and strategy_looking_for
-        if 'signals' in cycle_result and cycle_result['signals']:
-            signal_value = cycle_result['signals'].get('signal', 0)
-            signal_name = cycle_result['signals'].get('signal_name', 'neutral')
-            
-            # Determine what the strategy is looking for
-            if signal_name == 'strong_buy' or signal_name == 'buy':
-                strategy_looking_for = "BUY opportunity"
-                st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-                logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
-            elif signal_name == 'strong_sell' or signal_name == 'sell':
-                strategy_looking_for = "SELL opportunity"
-                st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-                logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
-            else:
-                strategy_looking_for = "Neutral - waiting for clearer signals"
-                st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-                logger.info(f"[{cycle_id}] Strategy is {strategy_looking_for}")
-                
-            # Update trade conditions
-            trade_conditions = {
-                "trend": cycle_result['signals'].get('trend_signal', 0),
-                "momentum": cycle_result['signals'].get('momentum_signal', 0),
-                "volume": cycle_result['signals'].get('volume_signal', 0),
-                "sentiment": cycle_result['signals'].get('sentiment_score', 0),
-                "signal_strength": abs(signal_value),
-                "signal_direction": "bullish" if signal_value > 0 else "bearish" if signal_value < 0 else "neutral"
-            }
-            st.session_state.trading_stats["trade_conditions"] = trade_conditions
-            
-            # Log the details
-            logger.info(f"[{cycle_id}] Signal: {signal_name} ({signal_value:.4f}), Direction: {trade_conditions['signal_direction']}, Strength: {trade_conditions['signal_strength']:.4f}")
-            logger.info(f"[{cycle_id}] Trend: {trade_conditions['trend']:.4f}, Momentum: {trade_conditions['momentum']:.4f}, Volume: {trade_conditions['volume']:.4f}, Sentiment: {trade_conditions['sentiment']:.4f}")
-        
-        # Check if a trade should be executed
-        if cycle_result.get('should_trade', False):
-            st.session_state.trading_stats["potential_trades_found"] += 1
-            st.session_state.trading_stats["current_status"] = "Trade opportunity found"
-            
-            logger.warning(f"[{cycle_id}] Trade opportunity detected: {cycle_result['signals'].get('signal_name', 'unknown')} with strength {cycle_result['signals'].get('signal', 0):.4f}")
-            
-            # Add to log
-            if 'log_entries' not in st.session_state:
-                st.session_state.log_entries = []
-                
-            st.session_state.log_entries.insert(0, {
-                "timestamp": datetime.now(),
-                "level": "WARNING",
-                "message": f"Trade opportunity detected: {cycle_result['signals'].get('signal_name', 'unknown')} with strength {cycle_result['signals'].get('signal', 0):.2f}"
-            })
-            
-            # If a trade was executed, update stats
-            if cycle_result.get('trade_result', {}).get('executed', False):
-                st.session_state.trading_stats["trades_executed"] += 1
-                st.session_state.trading_stats["current_status"] = "Trade executed"
-                
-                # Extract trade details
-                trade_details = cycle_result.get('trade_result', {}).get('trade', {})
-                side = trade_details.get('side', 'unknown')
-                qty = trade_details.get('qty', 0)
-                price = trade_details.get('filled_avg_price', 0)
-                order_id = trade_details.get('id', 'unknown')
-                
-                # Fix for NoneType format error - ensure price is not None before formatting
-                price_str = f"${price:.2f}" if price is not None else "market price"
-                logger.info(f"[{cycle_id}] Trade executed: {side} {qty} {symbol} at {price_str}, Order ID: {order_id}")
-                
-                # Add to log
-                st.session_state.log_entries.insert(0, {
-                    "timestamp": datetime.now(),
-                    "level": "SUCCESS",
-                    "message": f"Trade executed: {side} {qty} ETH at ${price:.2f}"
-                })
-        else:
-            st.session_state.trading_stats["current_status"] = "Monitoring markets"
-            logger.info(f"[{cycle_id}] No trade executed, continuing to monitor markets")
-        
-        # Set next check time
-        next_check = datetime.now() + timedelta(seconds=15)
-        st.session_state.trading_stats["next_check"] = next_check
-        
-        # Calculate and log cycle duration
-        cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
-        logger.info(f"[{cycle_id}] Trading cycle completed in {cycle_duration:.2f} seconds. Next check at {next_check.strftime('%H:%M:%S')}")
+        # Process the results and update UI
+        _process_trading_cycle_results(cycle_id, cycle_result, symbol, cycle_start_time)
         
     except Exception as e:
         error_msg = f"Error in trading cycle: {str(e)}"
@@ -537,161 +680,124 @@ def run_trading_cycle_with_stats(trading_strategy, timeframe, symbol='ETH/USD'):
         st.session_state.cycle_locks[cycle_lock_key]["running"] = False
         st.session_state.cycle_locks[cycle_lock_key]["last_run"] = datetime.now()
 
-# Async version of run_trading_cycle_with_stats
+# Create a simple wrapper for the async version
 async def run_trading_cycle_with_stats_async(trading_strategy, timeframe, symbol='ETH/USD'):
     """
-    Run a trading cycle asynchronously and update session state with trading stats
+    Async wrapper for run_trading_cycle_with_stats
+    This is just a stub to prevent errors - we'll actually run the sync version for reliability
     """
-    if not st.session_state.trading_active:
-        return
+    # Just call the synchronous version
+    return run_trading_cycle_with_stats(trading_strategy, timeframe, symbol)
+
+def _process_trading_cycle_results(cycle_id, cycle_result, symbol, cycle_start_time):
+    """Process the results of a trading cycle and update session state"""
+    # Update current price if available
+    if 'signals' in cycle_result and cycle_result['signals']:
+        if 'current_price' in cycle_result['signals']:
+            current_price = cycle_result['signals']['current_price']
+            st.session_state.trading_stats["current_price"] = current_price
+            logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
+        elif hasattr(cycle_result['signals'], 'get') and cycle_result['signals'].get('entry_point'):
+            current_price = cycle_result['signals']['entry_point']
+            st.session_state.trading_stats["current_price"] = current_price
+            logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
     
-    # Normalize timeframe to standard format
-    norm_timeframe = normalize_timeframe(timeframe)
+    # Update stats
+    st.session_state.trading_stats["cycles_completed"] += 1
     
-    # Generate a unique cycle identifier with timestamp to ensure uniqueness
-    cycle_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    cycle_id = f"Cycle-{st.session_state.trading_stats['cycles_completed'] + 1}-{cycle_timestamp}"
-    
-    # Check if there's already a cycle running for this symbol and timeframe
-    cycle_lock_key = f"{symbol}_{norm_timeframe}"
-    
-    # Initialize lock if it doesn't exist
-    if cycle_lock_key not in st.session_state.cycle_locks:
-        st.session_state.cycle_locks[cycle_lock_key] = {"running": False, "last_run": None}
-    
-    # Skip if a cycle is already running for this symbol/timeframe
-    if st.session_state.cycle_locks[cycle_lock_key]["running"]:
-        logger.info(f"Skipping duplicate async cycle for {symbol} on {norm_timeframe}")
-        return
-    
-    # Set cycle as running
-    st.session_state.cycle_locks[cycle_lock_key]["running"] = True
-    cycle_start_time = datetime.now()
-    
-    try:
-        # Update last check time
-        st.session_state.trading_stats["last_check"] = cycle_start_time
-        logger.info(f"[{cycle_id}] Starting async trading cycle for {symbol} on {norm_timeframe} timeframe")
+    # Update current_status and strategy_looking_for
+    if 'signals' in cycle_result and cycle_result['signals']:
+        signal_value = cycle_result['signals'].get('signal', 0)
+        signal_strength = abs(signal_value) if signal_value is not None else 0
+        signal_direction = "bullish" if signal_value > 0 else "bearish" if signal_value < 0 else "neutral"
+        signal_name = cycle_result['signals'].get('signal_direction', 'neutral')
         
-        # Run the trading cycle using async method
-        cycle_result = await trading_strategy.run_trading_cycle_async(symbol, norm_timeframe)
-        
-        # Update current price if available
-        if 'signals' in cycle_result and cycle_result['signals']:
-            if 'current_price' in cycle_result['signals']:
-                current_price = cycle_result['signals']['current_price']
-                st.session_state.trading_stats["current_price"] = current_price
-                logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
-            elif hasattr(cycle_result['signals'], 'get') and cycle_result['signals'].get('entry_point'):
-                current_price = cycle_result['signals']['entry_point']
-                st.session_state.trading_stats["current_price"] = current_price
-                logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
-        
-        # Update stats
-        st.session_state.trading_stats["cycles_completed"] += 1
-        
-        # Update current_status and strategy_looking_for
-        if 'signals' in cycle_result and cycle_result['signals']:
-            signal_value = cycle_result['signals'].get('signal', 0)
-            signal_name = cycle_result['signals'].get('signal_name', 'neutral')
-            
-            # Determine what the strategy is looking for
-            if signal_name == 'strong_buy' or signal_name == 'buy':
-                strategy_looking_for = "BUY opportunity"
-                st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-                logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
-            elif signal_name == 'strong_sell' or signal_name == 'sell':
-                strategy_looking_for = "SELL opportunity"
-                st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-                logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
-            else:
-                strategy_looking_for = "Neutral - waiting for clearer signals"
-                st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-                logger.info(f"[{cycle_id}] Strategy is {strategy_looking_for}")
-                
-            # Update trade conditions
-            trade_conditions = {
-                "trend": cycle_result['signals'].get('trend_signal', 0),
-                "momentum": cycle_result['signals'].get('momentum_signal', 0),
-                "volume": cycle_result['signals'].get('volume_signal', 0),
-                "sentiment": cycle_result['signals'].get('sentiment_score', 0),
-                "signal_strength": abs(signal_value),
-                "signal_direction": "bullish" if signal_value > 0 else "bearish" if signal_value < 0 else "neutral"
-            }
-            st.session_state.trading_stats["trade_conditions"] = trade_conditions
-            
-            # Log the details
-            logger.info(f"[{cycle_id}] Signal: {signal_name} ({signal_value:.4f}), Direction: {trade_conditions['signal_direction']}, Strength: {trade_conditions['signal_strength']:.4f}")
-            
-        # Check if a trade should be executed
-        if cycle_result.get('should_trade', False):
-            st.session_state.trading_stats["potential_trades_found"] += 1
-            st.session_state.trading_stats["current_status"] = "Trade opportunity found"
-            
-            logger.warning(f"[{cycle_id}] Trade opportunity detected: {cycle_result['signals'].get('signal_name', 'unknown')} with strength {cycle_result['signals'].get('signal', 0):.4f}")
-            
-            # Add to log
-            if 'log_entries' not in st.session_state:
-                st.session_state.log_entries = []
-                
-            st.session_state.log_entries.insert(0, {
-                "timestamp": datetime.now(),
-                "level": "WARNING",
-                "message": f"Trade opportunity detected: {cycle_result['signals'].get('signal_name', 'unknown')} with strength {cycle_result['signals'].get('signal', 0):.2f}"
-            })
-            
-            # If a trade was executed, update stats
-            if cycle_result.get('trade_result', {}).get('executed', False):
-                st.session_state.trading_stats["trades_executed"] += 1
-                st.session_state.trading_stats["current_status"] = "Trade executed"
-                
-                # Extract trade details
-                trade_details = cycle_result.get('trade_result', {}).get('trade', {})
-                side = trade_details.get('side', 'unknown')
-                qty = trade_details.get('qty', 0)
-                price = trade_details.get('filled_avg_price', 0)
-                order_id = trade_details.get('id', 'unknown')
-                
-                # Fix for NoneType format error - ensure price is not None before formatting
-                price_str = f"${price:.2f}" if price is not None else "market price"
-                logger.info(f"[{cycle_id}] Trade executed: {side} {qty} {symbol} at {price_str}, Order ID: {order_id}")
-                
-                # Add to log
-                st.session_state.log_entries.insert(0, {
-                    "timestamp": datetime.now(),
-                    "level": "SUCCESS",
-                    "message": f"Trade executed: {side} {qty} ETH at ${price:.2f}"
-                })
+        # Determine what the strategy is looking for
+        if signal_name == 'buy':
+            strategy_looking_for = "BUY opportunity"
+            st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
+            logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
+        elif signal_name == 'sell':
+            strategy_looking_for = "SELL opportunity"
+            st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
+            logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
         else:
-            st.session_state.trading_stats["current_status"] = "Monitoring markets"
-            logger.info(f"[{cycle_id}] No trade executed, continuing to monitor markets")
+            strategy_looking_for = "Neutral - waiting for clearer signals"
+            st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
+            logger.info(f"[{cycle_id}] Strategy is {strategy_looking_for}")
+            
+        # Extract component signals
+        components = cycle_result['signals'].get('components', {})
+        trend = components.get('trend', 0)
+        momentum = components.get('momentum', 0)
+        volume = components.get('volume', 0)
         
-        # Set next check time
-        next_check = datetime.now() + timedelta(seconds=st.session_state.refresh_interval)
-        st.session_state.trading_stats["next_check"] = next_check
+        # Update trade conditions
+        trade_conditions = {
+            "trend": trend,
+            "momentum": momentum, 
+            "volume": volume,
+            "sentiment": cycle_result['signals'].get('sentiment_score', 0),
+            "signal_strength": signal_strength,
+            "signal_direction": signal_direction
+        }
+        st.session_state.trading_stats["trade_conditions"] = trade_conditions
         
-        # Calculate and log cycle duration
-        cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
-        logger.info(f"[{cycle_id}] Async trading cycle completed in {cycle_duration:.2f} seconds. Next check at {next_check.strftime('%H:%M:%S')}")
+        # Log the details
+        logger.info(f"[{cycle_id}] Signal: {signal_name} ({signal_value:.4f}), Direction: {signal_direction}, Strength: {signal_strength:.4f}")
+    
+    # Check if a trade should be executed
+    if cycle_result.get('should_trade', False):
+        st.session_state.trading_stats["potential_trades_found"] += 1
+        st.session_state.trading_stats["current_status"] = "Trade opportunity found"
         
-        return cycle_result
+        signal_name = cycle_result['signals'].get('signal_direction', 'unknown')
+        signal_value = cycle_result['signals'].get('signal', 0)
+        logger.warning(f"[{cycle_id}] Trade opportunity detected: {signal_name} with strength {signal_value:.4f}")
         
-    except Exception as e:
-        logger.error(f"Error in async trading cycle: {str(e)}", exc_info=True)
-        st.session_state.trading_stats["current_status"] = "Error in cycle"
         # Add to log
         if 'log_entries' not in st.session_state:
             st.session_state.log_entries = []
+            
         st.session_state.log_entries.insert(0, {
             "timestamp": datetime.now(),
-            "level": "ERROR",
-            "message": f"Error in async trading cycle: {str(e)}"
+            "level": "WARNING",
+            "message": f"Trade opportunity detected: {signal_name} with strength {signal_value:.2f}"
         })
-        return None
-    finally:
-        # Mark the cycle as no longer running and update last run time
-        st.session_state.cycle_locks[cycle_lock_key]["running"] = False
-        st.session_state.cycle_locks[cycle_lock_key]["last_run"] = datetime.now()
+        
+        # If a trade was executed, update stats
+        if cycle_result.get('trade_result', {}).get('executed', False):
+            st.session_state.trading_stats["trades_executed"] += 1
+            st.session_state.trading_stats["current_status"] = "Trade executed"
+            
+            # Extract trade details
+            trade_details = cycle_result.get('trade_result', {}).get('trade', {})
+            side = trade_details.get('side', 'unknown')
+            qty = trade_details.get('qty', 0)
+            price = trade_details.get('filled_avg_price', 0)
+            order_id = trade_details.get('id', 'unknown')
+            
+            # Fix for NoneType format error - ensure price is not None before formatting
+            price_str = f"${price:.2f}" if price is not None else "market price"
+            logger.info(f"[{cycle_id}] Trade executed: {side} {qty} {symbol} at {price_str}, Order ID: {order_id}")
+            
+            # Add to log
+            st.session_state.log_entries.insert(0, {
+                "timestamp": datetime.now(),
+                "level": "SUCCESS",
+                "message": f"Trade executed: {side} {qty} ETH at {price_str}"
+            })
+    else:
+        st.session_state.trading_stats["current_status"] = "Monitoring markets"
+        logger.info(f"[{cycle_id}] No trade executed, continuing to monitor markets")
+    
+    # Set next check time
+    next_check = datetime.now() + timedelta(seconds=15)
+    st.session_state.trading_stats["next_check"] = next_check
+    
+    # Calculate and log cycle duration
+    cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
+    logger.info(f"[{cycle_id}] Trading cycle completed in {cycle_duration:.2f} seconds. Next check at {next_check.strftime('%H:%M:%S')}")
 
 # Get market data with caching
 @st.cache_data(ttl=60)
@@ -714,13 +820,136 @@ def get_crypto_data(_trading_strategy, symbol='ETH/USD', timeframe='1H', limit=1
 def main():
     """Main application function."""
     try:
-        # Title and description
-        st.title("CryptoTrading - Advanced Auto-Trading System")
-        st.markdown("""
-        <div style="background-color: #1E2127; padding: 10px; border-radius: 5px; margin-bottom: 20px;">
-            <p>Professional-grade cryptocurrency trading system with real-time signals, automated execution, and comprehensive risk management.</p>
-        </div>
-        """, unsafe_allow_html=True)
+        # Initialize session state variables if they don't exist
+        if 'initialized' not in st.session_state:
+            st.session_state.initialized = False
+            
+        # Initialize trading status variables
+        if 'trading_active' not in st.session_state:
+            st.session_state.trading_active = True  # Default to active
+            
+        # Initialize trading pairs
+        if 'default_trading_pair' not in st.session_state:
+            st.session_state.default_trading_pair = 'ETH/USD'
+            
+        # Initialize timeframe
+        if 'selected_timeframe' not in st.session_state:
+            st.session_state.selected_timeframe = '1 minute'
+            
+        # Initialize candles
+        if 'selected_candles' not in st.session_state:
+            st.session_state.selected_candles = 100
+            
+        # Initialize risk settings
+        if 'risk_per_trade' not in st.session_state:
+            st.session_state.risk_per_trade = 0.1  # Default 0.1% risk per trade
+            
+        # Initialize max trades per day
+        if 'max_trades_per_day' not in st.session_state:
+            st.session_state.max_trades_per_day = 20
+            
+        # Initialize refresh interval (seconds)
+        if 'refresh_interval' not in st.session_state:
+            st.session_state.refresh_interval = 15
+            
+        # Initialize trading stats
+        if 'trading_stats' not in st.session_state:
+            st.session_state.trading_stats = {
+                "current_price": None,
+                "last_check": None,
+                "next_check": None,
+                "cycles_completed": 0,
+                "trades_executed": 0,
+                "potential_trades_found": 0,
+                "current_status": "Initializing",
+                "strategy_looking_for": "Analyzing market",
+                "trade_conditions": {
+                    "trend": 0,
+                    "momentum": 0,
+                    "volume": 0,
+                    "sentiment": 0,
+                    "signal_strength": 0,
+                    "signal_direction": "neutral"
+                }
+            }
+            
+        # Initialize cycle locks for preventing duplicate cycles
+        if 'cycle_locks' not in st.session_state:
+            st.session_state.cycle_locks = {}
+            
+        # Initialize log entries
+        if 'log_entries' not in st.session_state:
+            st.session_state.log_entries = []
+            
+        # Initialize thread-related variables
+        if 'update_thread_running' not in st.session_state:
+            st.session_state.update_thread_running = False
+        if 'last_update_time' not in st.session_state:
+            st.session_state.last_update_time = None
+        if 'trigger_update' not in st.session_state:
+            st.session_state.trigger_update = False
+        if 'last_ui_update_time' not in st.session_state:
+            st.session_state.last_ui_update_time = time.time()
+        if 'refresh_count' not in st.session_state:
+            st.session_state.refresh_count = 0
+        if 'data_updated' not in st.session_state:
+            st.session_state.data_updated = False
+            
+        # Get refresh interval in milliseconds for st_autorefresh
+        refresh_interval_ms = st.session_state.refresh_interval * 1000  # Convert seconds to milliseconds
+        
+        # Add auto-refresh component that will trigger UI updates
+        refresh_count = st_autorefresh(interval=refresh_interval_ms, key="autorefresh", limit=None)
+        
+        # Update refresh count in session state
+        st.session_state.refresh_count = refresh_count
+        
+        # Try to load the persistent state first
+        try:
+            persistent_state = load_persistent_state()
+            if persistent_state:
+                # Update session state with persistent values
+                for key, value in persistent_state.items():
+                    if key not in st.session_state or st.session_state[key] != value:
+                        st.session_state[key] = value
+                        logger.info(f"Loaded {key}={value} from persistent state")
+        except Exception as e:
+            logger.error(f"Error loading persistent state: {e}")
+            
+        # Mark as initialized
+        st.session_state.initialized = True
+            
+        # Use Streamlit's rerun mechanism to update the UI when triggered
+        if st.session_state.trigger_update:
+            # Reset trigger flag
+            st.session_state.trigger_update = False
+            
+            # Record UI update time
+            st.session_state.last_ui_update_time = time.time()
+            
+            # Force a rerun
+            st.rerun()
+            
+        # Ensure the update thread is running
+        ensure_update_thread()
+        
+        # Load environment variables
+        env_vars = load_environment_variables()
+        
+        # Create containers for the different sections that we'll update without page refresh
+        header_container = st.container()
+        chart_container = st.container()
+        signals_container = st.container()
+        trading_details_container = st.container()
+        
+        with header_container:
+            # Title and description
+            st.title("CryptoTrading - Advanced Auto-Trading System")
+            st.markdown("""
+            Real-time automated cryptocurrency trading with advanced signal processing and risk management.
+            This system continuously monitors the market and executes trades based on technical analysis, 
+            sentiment signals and custom parameters.
+            """)
         
         # Verify API credentials
         credentials_available = verify_secrets()
@@ -774,10 +1003,10 @@ def main():
         # Auto-refresh every 15 seconds
         refresh_interval = st.sidebar.slider(
             "Refresh Interval (seconds)", 
-            min_value=15,
+            min_value=5,
             max_value=300,
             value=st.session_state.refresh_interval,
-            step=15,
+            step=5,
             help="How frequently to check for trading opportunities. Lower values provide more real-time data but may increase API usage."
         )
         
@@ -785,8 +1014,148 @@ def main():
         if refresh_interval != st.session_state.refresh_interval:
             st.session_state.refresh_interval = refresh_interval
             save_persistent_state({"refresh_interval": refresh_interval})
-            
-        st_autorefresh(interval=refresh_interval * 1000, key="datarefresh")
+        
+        # Create a container to show the last update time
+        update_status = st.empty()
+        if st.session_state.last_update_time:
+            last_update = datetime.fromtimestamp(st.session_state.last_update_time)
+            update_status.info(f"Last data update: {last_update.strftime('%H:%M:%S')} (UI refresh count: {refresh_count})")
+        else:
+            update_status.info("Waiting for first data update...")
+        
+        # Define a fragment to periodically refresh the dashboard data
+        # This allows for updating the UI without a full page reload
+        @st.fragment(run_every=refresh_interval)
+        def auto_refresh_dashboard():
+            # Update the UI with latest data
+            if 'system' in st.session_state and 'trading_strategy' in st.session_state.system:
+                trading_strategy = st.session_state.system['trading_strategy']
+                
+                # Only run if trading is active
+                if st.session_state.trading_active:
+                    try:
+                        # Record UI update time
+                        st.session_state.last_ui_update_time = time.time()
+                        
+                        # Update the last update time display
+                        if st.session_state.last_update_time:
+                            last_update = datetime.fromtimestamp(st.session_state.last_update_time)
+                            update_status.info(f"Last data update: {last_update.strftime('%H:%M:%S')} (UI refresh count: {refresh_count})")
+                        
+                        # Update trading details in the designated container
+                        with trading_details_container:
+                            # Create two columns for trading details
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.subheader("Auto-Trading Details")
+                                st.markdown("<div style='height: 10px'></div>", unsafe_allow_html=True)
+                                
+                                # Create an expandable section for trading details
+                                with st.expander("Auto-Trading Details", expanded=True):
+                                    # Display last check time and next check time
+                                    last_check_time = st.session_state.trading_stats.get("last_check", None)
+                                    next_check_time = st.session_state.trading_stats.get("next_check", None)
+                                    
+                                    # Format the times for display
+                                    last_check_str = last_check_time.strftime("%H:%M:%S") if last_check_time else "N/A"
+                                    next_check_str = next_check_time.strftime("%H:%M:%S") if next_check_time else "N/A"
+                                    
+                                    # Create a grid for the values
+                                    check_times_cols = st.columns(2)
+                                    with check_times_cols[0]:
+                                        st.markdown("**Last check:**")
+                                        st.markdown(f"<h3 style='margin-top:-10px'>{last_check_str}</h3>", unsafe_allow_html=True)
+                                    
+                                    with check_times_cols[1]:
+                                        st.markdown("**Next check:**")
+                                        st.markdown(f"<h3 style='margin-top:-10px'>{next_check_str}</h3>", unsafe_allow_html=True)
+                                    
+                                    # Show trading stats
+                                    cycles_completed = st.session_state.trading_stats.get("cycles_completed", 0)
+                                    trades_executed = st.session_state.trading_stats.get("trades_executed", 0)
+                                    
+                                    stats_cols = st.columns(2)
+                                    with stats_cols[0]:
+                                        st.markdown("**Cycles completed:**")
+                                        st.markdown(f"<h3 style='margin-top:-10px'>{cycles_completed}</h3>", unsafe_allow_html=True)
+                                    
+                                    with stats_cols[1]:
+                                        st.markdown("**Trade opportunities:**")
+                                        st.markdown(f"<h3 style='margin-top:-10px'>{trades_executed}</h3>", unsafe_allow_html=True)
+                            
+                            with col2:
+                                # Display current signal conditions
+                                st.subheader("Current Signal Conditions")
+                                st.markdown("<div style='height: 10px'></div>", unsafe_allow_html=True)
+                                
+                                # Get signal data from trading stats
+                                signal_strength = 0.0
+                                signal_direction = "neutral"
+                                
+                                if "trade_conditions" in st.session_state.trading_stats:
+                                    conditions = st.session_state.trading_stats["trade_conditions"]
+                                    signal_strength = abs(conditions.get("signal_strength", 0))
+                                    signal_direction = conditions.get("signal_direction", "neutral")
+                                
+                                # Format signal direction with colors
+                                direction_color = "#888888"  # neutral gray
+                                if signal_direction == "bullish":
+                                    direction_color = "#4CAF50"  # green
+                                elif signal_direction == "bearish":
+                                    direction_color = "#F44336"  # red
+                                
+                                st.markdown(f"**Signal Strength:** {signal_strength:.2f}")
+                                st.markdown(f"**Direction:** <span style='color:{direction_color}'>{signal_direction}</span>", unsafe_allow_html=True)
+                                
+                                # Signal component visualization
+                                if "trade_conditions" in st.session_state.trading_stats:
+                                    conditions = st.session_state.trading_stats["trade_conditions"]
+                                    
+                                    # Create columns for each component
+                                    component_cols = st.columns(4)
+                                    
+                                    # Helper function to display a signal component
+                                    def signal_indicator(value, name):
+                                        value_rounded = round(value, 2)
+                                        background_color = "#333333"
+                                        text_color = "#FFFFFF"
+                                        
+                                        if value > 0:
+                                            background_color = "#4CAF50"  # green
+                                        elif value < 0:
+                                            background_color = "#F44336"  # red
+                                            
+                                        return f"""
+                                        <div style="background-color: {background_color}; color: {text_color}; 
+                                                    padding: 10px; border-radius: 5px; text-align: center; margin-bottom: 5px;">
+                                            <div style="font-size: 18px; font-weight: bold;">{value_rounded}</div>
+                                            <div style="font-size: 12px;">{name}</div>
+                                        </div>
+                                        """
+                                    
+                                    # Display each component
+                                    with component_cols[0]:
+                                        st.markdown(signal_indicator(conditions.get("trend", 0), "Trend"), unsafe_allow_html=True)
+                                    
+                                    with component_cols[1]:
+                                        st.markdown(signal_indicator(conditions.get("momentum", 0), "Momentum"), unsafe_allow_html=True)
+                                    
+                                    with component_cols[2]:
+                                        st.markdown(signal_indicator(conditions.get("volume", 0), "Volume"), unsafe_allow_html=True)
+                                    
+                                    with component_cols[3]:
+                                        st.markdown(signal_indicator(conditions.get("sentiment", 0), "Sentiment"), unsafe_allow_html=True)
+
+                        # Reset the data updated flag after refreshing the UI
+                        if hasattr(st.session_state, 'data_updated') and st.session_state.data_updated:
+                            st.session_state.data_updated = False
+                                
+                    except Exception as e:
+                        logger.error(f"Error in auto-refresh fragment: {e}")
+
+        # Call the fragment to start the auto-refresh cycle
+        auto_refresh_dashboard()
         
         # Load configuration
         config = load_config()
@@ -798,7 +1167,21 @@ def main():
         position_calculator = system['position_calculator']
         signal_aggregator = system['signal_aggregator']
         order_manager = system['order_manager']
-        alpaca_api = system['apis']['alpaca']
+        alpaca_api = system['apis'].get('alpaca')
+        
+        # Store system in session state for cleanup function to access
+        st.session_state.system = system
+        
+        # Check if we have a fully initialized system
+        if trading_strategy is None or alpaca_api is None:
+            st.error("Trading system failed to initialize completely. Some features may be limited.")
+            st.warning("Try refreshing the page. If the problem persists, check your API credentials and connection.")
+            
+            # Disable trading if the system is not fully initialized
+            st.session_state.trading_active = False
+            
+            # Skip trading-related code that requires the full system
+            return
         
         # Run trading check if auto-trading is active
         if st.session_state.trading_active:
@@ -811,18 +1194,28 @@ def main():
                 norm_tf = normalize_timeframe(selected_tf)
                 
                 # Use async version if available
-                if hasattr(trading_strategy, 'run_trading_cycle_async'):
+                try:
+                    # Check if the async function is defined in this module
+                    if 'run_trading_cycle_with_stats_async' in globals():
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                        
+                        # Run the async cycle with the normalized timeframe
+                        loop.run_until_complete(run_trading_cycle_with_stats_async(trading_strategy, norm_tf))
+                    else:
+                        # Fall back to synchronous version
+                        logger.info("Async method not found, using synchronous trading cycle")
+                        run_trading_cycle_with_stats(trading_strategy, norm_tf)
+                except Exception as e:
+                    logger.error(f"Error running trading cycle: {e}")
+                    # Fall back to synchronous version as a last resort
                     try:
-                        loop = asyncio.get_event_loop()
-                    except RuntimeError:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                    
-                    # Run the async cycle with the normalized timeframe
-                    loop.run_until_complete(run_trading_cycle_with_stats_async(trading_strategy, norm_tf))
-                else:
-                    # Use normalized timeframe
-                    run_trading_cycle_with_stats(trading_strategy, norm_tf)
+                        run_trading_cycle_with_stats(trading_strategy, norm_tf)
+                    except Exception as e2:
+                        logger.error(f"Critical error in trading cycle: {e2}")
                 
                 # Add initialization log if first run
                 if st.session_state.trading_stats["cycles_completed"] == 1:
@@ -1014,330 +1407,351 @@ def main():
                 st.info(descriptions[strategy_mode])
             
             # Create columns for market data and trading interface
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.subheader("ETH/USD Price Chart")
+            with chart_container:
+                col1, col2 = st.columns([2, 1])
                 
-                # Get market data
-                df = get_crypto_data(
-                    trading_strategy,
-                    timeframe=timeframe_options[selected_timeframe],
-                    limit=selected_candles
-                )
-                
-                # Run trading cycle every time the app refreshes (if trading is active)
-                if st.session_state.trading_active:
-                    if hasattr(trading_strategy, 'run_trading_cycle_async'):
-                        # Set up the async environment for Streamlit
+                with col1:
+                    st.subheader("ETH/USD Price Chart")
+                    
+                    # Create a placeholder for the chart that we can update
+                    chart_placeholder = st.empty()
+                    
+                    # Get market data
+                    df = get_crypto_data(
+                        trading_strategy,
+                        timeframe=timeframe_options[selected_timeframe],
+                        limit=selected_candles
+                    )
+                    
+                    # Run trading cycle every time there's a scheduled update but without full page refresh
+                    if st.session_state.trading_active and st.session_state.get('trigger_update', False):
+                        st.session_state.trigger_update = False  # Reset the trigger
+                        
                         try:
-                            loop = asyncio.get_event_loop()
-                        except RuntimeError:
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
+                            # Check if the async function is defined in this module
+                            if 'run_trading_cycle_with_stats_async' in globals():
+                                # Set up the async environment for Streamlit
+                                try:
+                                    loop = asyncio.get_event_loop()
+                                except RuntimeError:
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    
+                                # Run the async cycle
+                                run_result = loop.run_until_complete(
+                                    run_trading_cycle_with_stats_async(trading_strategy, timeframe_options[selected_timeframe])
+                                )
+                            else:
+                                # Fall back to synchronous version
+                                logger.info("Async method not found, using synchronous trading cycle")
+                                run_result = run_trading_cycle_with_stats(trading_strategy, timeframe_options[selected_timeframe])
+                        except Exception as e:
+                            logger.error(f"Error running trading cycle: {e}")
+                            # Fall back to synchronous version as a last resort
+                            try:
+                                run_result = run_trading_cycle_with_stats(trading_strategy, timeframe_options[selected_timeframe])
+                            except Exception as e2:
+                                logger.error(f"Critical error in trading cycle: {e2}")
+                        
+                        # Update the last update time display
+                        if st.session_state.last_update_time:
+                            last_update = datetime.fromtimestamp(st.session_state.last_update_time)
+                            update_status.info(f"Last data update: {last_update.strftime('%H:%M:%S')} (UI refresh count: {refresh_count})")
+                    
+                    if not df.empty:
+                        # Add technical indicators if not already present
+                        if 'ema_20' not in df.columns:
+                            from technical.indicators import TechnicalIndicators
+                            df = TechnicalIndicators.add_all_indicators(df, config.get('technical_indicators', {}))
+                        
+                        # Create price chart
+                        fig = go.Figure()
+                        
+                        # Add candlestick chart
+                        fig.add_trace(
+                            go.Candlestick(
+                                x=df.index,
+                                open=df['open'],
+                                high=df['high'],
+                                low=df['low'],
+                                close=df['close'],
+                                name='ETH/USD'
+                            )
+                        )
+                        
+                        # Add technical indicators
+                        if 'ema_20' in df.columns:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=df.index,
+                                    y=df['ema_20'],
+                                    name='EMA 20',
+                                    line=dict(width=1, color='rgba(13, 71, 161, 0.7)')
+                                )
+                            )
+                        
+                        if 'ema_50' in df.columns:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=df.index,
+                                    y=df['ema_50'],
+                                    name='EMA 50',
+                                    line=dict(width=1, color='rgba(187, 134, 252, 0.8)')
+                                )
+                            )
+                        
+                        if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=df.index,
+                                    y=df['bb_upper'],
+                                    name='BB Upper',
+                                    line=dict(width=1, color='rgba(0, 200, 0, 0.5)'),
+                                    showlegend=True
+                                )
+                            )
                             
-                        # Run the async cycle
-                        run_result = loop.run_until_complete(
-                            run_trading_cycle_with_stats_async(trading_strategy, timeframe_options[selected_timeframe])
-                        )
-                    else:
-                        # Fall back to synchronous version
-                        run_result = run_trading_cycle_with_stats(trading_strategy, timeframe_options[selected_timeframe])
-                
-                if not df.empty:
-                    # Add technical indicators if not already present
-                    if 'ema_20' not in df.columns:
-                        from technical.indicators import TechnicalIndicators
-                        df = TechnicalIndicators.add_all_indicators(df, config.get('technical_indicators', {}))
-                    
-                    # Create price chart
-                    fig = go.Figure()
-                    
-                    # Add candlestick chart
-                    fig.add_trace(
-                        go.Candlestick(
-                            x=df.index,
-                            open=df['open'],
-                            high=df['high'],
-                            low=df['low'],
-                            close=df['close'],
-                            name='ETH/USD'
-                        )
-                    )
-                    
-                    # Add technical indicators
-                    if 'ema_20' in df.columns:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=df.index,
-                                y=df['ema_20'],
-                                name='EMA 20',
-                                line=dict(width=1, color='rgba(13, 71, 161, 0.7)')
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=df.index,
+                                    y=df['bb_lower'],
+                                    name='BB Lower',
+                                    line=dict(width=1, color='rgba(200, 0, 0, 0.5)'),
+                                    showlegend=True
+                                )
                             )
-                        )
-                    
-                    if 'ema_50' in df.columns:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=df.index,
-                                y=df['ema_50'],
-                                name='EMA 50',
-                                line=dict(width=1, color='rgba(187, 134, 252, 0.8)')
-                            )
-                        )
-                    
-                    if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=df.index,
-                                y=df['bb_upper'],
-                                name='BB Upper',
-                                line=dict(width=1, color='rgba(0, 200, 0, 0.5)'),
-                                showlegend=True
-                            )
+                        
+                        # Update layout
+                        fig.update_layout(
+                            title=f"ETH/USD - {selected_timeframe}",
+                            yaxis_title="Price (USD)",
+                            xaxis_title="Time",
+                            height=600,
+                            template="plotly_dark",
+                            xaxis_rangeslider_visible=False,
+                            margin=dict(l=10, r=10, t=40, b=10)
                         )
                         
-                        fig.add_trace(
-                            go.Scatter(
-                                x=df.index,
-                                y=df['bb_lower'],
-                                name='BB Lower',
-                                line=dict(width=1, color='rgba(200, 0, 0, 0.5)'),
-                                showlegend=True
-                            )
-                        )
-                    
-                    # Update layout
-                    fig.update_layout(
-                        title=f"ETH/USD - {selected_timeframe}",
-                        yaxis_title="Price (USD)",
-                        xaxis_title="Time",
-                        height=600,
-                        template="plotly_dark",
-                        xaxis_rangeslider_visible=False,
-                        margin=dict(l=10, r=10, t=40, b=10)
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Get sentiment data
-                    sentiment_data = trading_strategy.get_sentiment_data()
-                    
-                    # Generate comprehensive signals
-                    signals = trading_strategy.generate_signals(df, sentiment_data)
-                    st.session_state.latest_signals = signals
-                    
-                    # Display signals in a more organized way
-                    st.subheader("Trading Signals")
-                    
-                    # Create a tab structure for different signal categories
-                    signal_tabs = st.tabs(["Technical", "Sentiment", "Risk"])
-                    
-                    with signal_tabs[0]:  # Technical tab
-                        signal_cols = st.columns(3)
+                        chart_placeholder.plotly_chart(fig, use_container_width=True)
                         
-                        with signal_cols[0]:
-                            trend_val = signals.get('trend_signal', signals.get('trend', 0))
-                            trend_display = f"{trend_val:.2f}" if not np.isnan(trend_val) else "0.00"
-                            st.metric("Trend Signal", trend_display)
-                        with signal_cols[1]:
-                            momentum_val = signals.get('momentum_signal', signals.get('momentum', 0))
-                            momentum_display = f"{momentum_val:.2f}" if not np.isnan(momentum_val) else "0.00"
-                            st.metric("Momentum", momentum_display)
-                        with signal_cols[2]:
-                            volume_val = signals.get('volume_signal', signals.get('volume', 0))
-                            volume_display = f"{volume_val:.2f}" if not np.isnan(volume_val) else "0.00"
-                            st.metric("Volume Signal", volume_display)
-                    
-                    with signal_tabs[1]:  # Sentiment tab
-                        sentiment_cols = st.columns(3)
+                        # Get sentiment data
+                        sentiment_data = trading_strategy.get_sentiment_data()
                         
-                        with sentiment_cols[0]:
-                            sentiment_score = sentiment_data.get('sentiment_score', 0)
-                            st.metric("News Sentiment", f"{sentiment_score:.2f}")
-                        with sentiment_cols[1]:
-                            news_count = sentiment_data.get('news_count', 0)
-                            st.metric("News Count", f"{news_count}")
-                        with sentiment_cols[2]:
-                            change_24h = sentiment_data.get('percent_change_24h', 0)
-                            st.metric("24h Change", f"{change_24h:.2f}%")
-                    
-                    with signal_tabs[2]:  # Risk tab
-                        risk_cols = st.columns(3)
+                        # Generate comprehensive signals
+                        signals = trading_strategy.generate_signals(df, sentiment_data)
+                        st.session_state.latest_signals = signals
                         
-                        with risk_cols[0]:
-                            volatility_val = signals.get('volatility', 0)
-                            volatility_display = f"{volatility_val:.2f}%" if not np.isnan(volatility_val) else "0.00%"
-                            st.metric("Volatility (24h)", volatility_display)
-                        with risk_cols[1]:
-                            risk_score_val = signals.get('risk_score', 0) 
-                            risk_score_display = f"{risk_score_val:.2f}" if not np.isnan(risk_score_val) else "0.00"
-                            st.metric("Risk Score", risk_score_display)
-                        with risk_cols[2]:
-                            risk_reward_val = signals.get('risk_reward', 0)
-                            risk_reward_display = f"{risk_reward_val:.2f}" if not np.isnan(risk_reward_val) else "0.00"
-                            st.metric("Risk/Reward", risk_reward_display)
-                    
-                    # Overall signal
-                    signal_value = signals.get('signal', 0)
-                    signal_name = signals.get('signal_name', 'neutral')
-                    
-                    # Signal color based on name
-                    signal_color = {
-                        'strong_buy': '#4CAF50',
-                        'buy': '#8BC34A',
-                        'neutral': '#9E9E9E',
-                        'sell': '#FF9800',
-                        'strong_sell': '#F44336'
-                    }.get(signal_name, '#9E9E9E')
-                    
-                    st.markdown(f"""
-                    <div style="border-radius: 8px; background-color: {signal_color}; padding: 12px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.2);">
-                        <h2 style="margin: 0; color: white;">Overall Signal: {signal_name.upper()}</h2>
-                        <h3 style="margin: 0; color: white; opacity: 0.9;">{signal_value:.2f}</h3>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                else:
-                    st.error("Unable to load market data. Please check your connection.")
-            
-            with col2:
-                st.subheader("Trading Interface")
-                
-                # Add Auto-Trading Status Panel if active
-                if st.session_state.trading_active:
-                    auto_trading_status = st.container()
-                    with auto_trading_status:
-                        status_color = {
-                            "Monitoring markets": "#1E88E5",  # Blue
-                            "Trade opportunity found": "#FFA726",  # Orange
-                            "Trade executed": "#66BB6A",  # Green
-                            "Inactive": "#757575"  # Gray
-                        }.get(st.session_state.trading_stats["current_status"], "#757575")
+                        # Display signals in a more organized way
+                        st.subheader("Trading Signals")
                         
-                        # Create an eye-catching status indicator
+                        # Create a tab structure for different signal categories
+                        signal_tabs = st.tabs(["Technical", "Sentiment", "Risk"])
+                        
+                        with signal_tabs[0]:  # Technical tab
+                            signal_cols = st.columns(3)
+                            
+                            with signal_cols[0]:
+                                trend_val = signals.get('trend_signal', signals.get('trend', 0))
+                                trend_display = f"{trend_val:.2f}" if not np.isnan(trend_val) else "0.00"
+                                st.metric("Trend Signal", trend_display)
+                            with signal_cols[1]:
+                                momentum_val = signals.get('momentum_signal', signals.get('momentum', 0))
+                                momentum_display = f"{momentum_val:.2f}" if not np.isnan(momentum_val) else "0.00"
+                                st.metric("Momentum", momentum_display)
+                            with signal_cols[2]:
+                                volume_val = signals.get('volume_signal', signals.get('volume', 0))
+                                volume_display = f"{volume_val:.2f}" if not np.isnan(volume_val) else "0.00"
+                                st.metric("Volume Signal", volume_display)
+                        
+                        with signal_tabs[1]:  # Sentiment tab
+                            sentiment_cols = st.columns(3)
+                            
+                            with sentiment_cols[0]:
+                                sentiment_score = sentiment_data.get('sentiment_score', 0)
+                                st.metric("News Sentiment", f"{sentiment_score:.2f}")
+                            with sentiment_cols[1]:
+                                news_count = sentiment_data.get('news_count', 0)
+                                st.metric("News Count", f"{news_count}")
+                            with sentiment_cols[2]:
+                                change_24h = sentiment_data.get('percent_change_24h', 0)
+                                st.metric("24h Change", f"{change_24h:.2f}%")
+                        
+                        with signal_tabs[2]:  # Risk tab
+                            risk_cols = st.columns(3)
+                            
+                            with risk_cols[0]:
+                                volatility_val = signals.get('volatility', 0)
+                                volatility_display = f"{volatility_val:.2f}%" if not np.isnan(volatility_val) else "0.00%"
+                                st.metric("Volatility (24h)", volatility_display)
+                            with risk_cols[1]:
+                                risk_score_val = signals.get('risk_score', 0) 
+                                risk_score_display = f"{risk_score_val:.2f}" if not np.isnan(risk_score_val) else "0.00"
+                                st.metric("Risk Score", risk_score_display)
+                            with risk_cols[2]:
+                                risk_reward_val = signals.get('risk_reward', 0)
+                                risk_reward_display = f"{risk_reward_val:.2f}" if not np.isnan(risk_reward_val) else "0.00"
+                                st.metric("Risk/Reward", risk_reward_display)
+                        
+                        # Overall signal
+                        signal_value = signals.get('signal', 0)
+                        signal_name = signals.get('signal_name', 'neutral')
+                        
+                        # Signal color based on name
+                        signal_color = {
+                            'strong_buy': '#4CAF50',
+                            'buy': '#8BC34A',
+                            'neutral': '#9E9E9E',
+                            'sell': '#FF9800',
+                            'strong_sell': '#F44336'
+                        }.get(signal_name, '#9E9E9E')
+                        
                         st.markdown(f"""
-                        <div style="padding: 12px; border-radius: 8px; background-color: {status_color}; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.2);">
-                            <h4 style="margin: 0; color: white; text-align: center; display: flex; align-items: center; justify-content: center;">
-                                <span style="animation: pulse 2s infinite; display: inline-block; margin-right: 8px;">●</span> 
-                                Auto-Trading: {st.session_state.trading_stats["current_status"]}
-                            </h4>
+                        <div style="border-radius: 8px; background-color: {signal_color}; padding: 12px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.2);">
+                            <h2 style="margin: 0; color: white;">Overall Signal: {signal_name.upper()}</h2>
+                            <h3 style="margin: 0; color: white; opacity: 0.9;">{signal_value:.2f}</h3>
                         </div>
-                        <style>
-                        @keyframes pulse {{
-                          0% {{ opacity: 0.5; }}
-                          50% {{ opacity: 1; }}
-                          100% {{ opacity: 0.5; }}
-                        }}
-                        </style>
                         """, unsafe_allow_html=True)
-                        
-                        # Create a metrics display for auto-trading
-                        metrics_cols = st.columns(2)
-                        with metrics_cols[0]:
-                            st.metric("Current ETH Price", f"${st.session_state.trading_stats['current_price']:.2f}")
-                        with metrics_cols[1]:
-                            strategy_color = {
-                                "BUY opportunity": "green",
-                                "SELL opportunity": "red",
-                                "Neutral - waiting for clearer signals": "gray"
-                            }.get(st.session_state.trading_stats["strategy_looking_for"], "gray")
+                    
+                    else:
+                        st.error("Unable to load market data. Please check your connection.")
+                
+                with col2:
+                    st.subheader("Trading Interface")
+                    
+                    # Add Auto-Trading Status Panel if active
+                    if st.session_state.trading_active:
+                        auto_trading_status = st.container()
+                        with auto_trading_status:
+                            status_color = {
+                                "Monitoring markets": "#1E88E5",  # Blue
+                                "Trade opportunity found": "#FFA726",  # Orange
+                                "Trade executed": "#66BB6A",  # Green
+                                "Inactive": "#757575"  # Gray
+                            }.get(st.session_state.trading_stats["current_status"], "#757575")
                             
+                            # Create an eye-catching status indicator
                             st.markdown(f"""
-                            <div style="padding: 8px; border-radius: 5px; background-color: {status_color}; opacity: 0.8; text-align: center;">
-                                <span style="font-weight: bold; color: white;">{st.session_state.trading_stats["strategy_looking_for"]}</span>
+                            <div style="padding: 12px; border-radius: 8px; background-color: {status_color}; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.2);">
+                                <h4 style="margin: 0; color: white; text-align: center; display: flex; align-items: center; justify-content: center;">
+                                    <span style="animation: pulse 2s infinite; display: inline-block; margin-right: 8px;">●</span> 
+                                    Auto-Trading: {st.session_state.trading_stats["current_status"]}
+                                </h4>
                             </div>
+                            <style>
+                            @keyframes pulse {{
+                              0% {{ opacity: 0.5; }}
+                              50% {{ opacity: 1; }}
+                              100% {{ opacity: 0.5; }}
+                            }}
+                            </style>
                             """, unsafe_allow_html=True)
-                        
-                        # Add more details with improved styling
-                        details = st.expander("Auto-Trading Details", expanded=True)
-                        with details:
-                            metrics_table = """
-                            <table style="width: 100%; margin-bottom: 10px;">
-                                <tr>
-                                    <td style="padding: 5px; font-weight: bold;">Last check:</td>
-                                    <td>{}</td>
-                                    <td style="padding: 5px; font-weight: bold;">Next check:</td>
-                                    <td>{}</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 5px; font-weight: bold;">Cycles completed:</td>
-                                    <td>{}</td>
-                                    <td style="padding: 5px; font-weight: bold;">Trade opportunities:</td>
-                                    <td>{}</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 5px; font-weight: bold;">Trades executed:</td>
-                                    <td>{}</td>
-                                    <td style="padding: 5px; font-weight: bold;"></td>
-                                    <td></td>
-                                </tr>
-                            </table>
-                            """.format(
-                                st.session_state.trading_stats['last_check'].strftime('%H:%M:%S') if st.session_state.trading_stats['last_check'] else 'N/A',
-                                st.session_state.trading_stats['next_check'].strftime('%H:%M:%S') if st.session_state.trading_stats['next_check'] else 'N/A',
-                                st.session_state.trading_stats['cycles_completed'],
-                                st.session_state.trading_stats['potential_trades_found'],
-                                st.session_state.trading_stats['trades_executed']
-                            )
                             
-                            st.markdown(metrics_table, unsafe_allow_html=True)
-                            
-                            # Show current signal details with improved styling
-                            if st.session_state.trading_stats["trade_conditions"]:
-                                conditions = st.session_state.trading_stats["trade_conditions"]
-                                st.markdown("<h4 style='margin-top: 15px; margin-bottom: 10px;'>Current Signal Conditions</h4>", unsafe_allow_html=True)
-                                
-                                # Signal strength indicator
-                                signal_strength = conditions.get('signal_strength', 0)
-                                signal_direction = conditions.get('signal_direction', 'neutral')
-                                signal_color = "green" if signal_direction == "bullish" else "red" if signal_direction == "bearish" else "gray"
-                                
-                                progress_value = min(signal_strength, 1.0)  # Cap at 1.0 for progress bar
+                            # Create a metrics display for auto-trading
+                            metrics_cols = st.columns(2)
+                            with metrics_cols[0]:
+                                st.metric("Current ETH Price", f"${st.session_state.trading_stats['current_price']:.2f}")
+                            with metrics_cols[1]:
+                                strategy_color = {
+                                    "BUY opportunity": "green",
+                                    "SELL opportunity": "red",
+                                    "Neutral - waiting for clearer signals": "gray"
+                                }.get(st.session_state.trading_stats["strategy_looking_for"], "gray")
                                 
                                 st.markdown(f"""
-                                <div style="margin-bottom: 15px;">
-                                    <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
-                                        <span>Signal Strength: {signal_strength:.2f}</span>
-                                        <span>Direction: {signal_direction.title()}</span>
-                                    </div>
-                                    <div style="width: 100%; background-color: #333; height: 8px; border-radius: 4px;">
-                                        <div style="width: {progress_value * 100}%; background-color: {signal_color}; height: 8px; border-radius: 4px;"></div>
-                                    </div>
+                                <div style="padding: 8px; border-radius: 5px; background-color: {status_color}; opacity: 0.8; text-align: center;">
+                                    <span style="font-weight: bold; color: white;">{st.session_state.trading_stats["strategy_looking_for"]}</span>
                                 </div>
                                 """, unsafe_allow_html=True)
-                                
-                                # Component signals with enhanced visuals
-                                cond_cols = st.columns(4)
-                                
-                                def signal_indicator(value, name):
-                                    color = "#66BB6A" if value > 0.1 else "#EF5350" if value < -0.1 else "#78909C"
-                                    return f"""
-                                    <div style="text-align: center; padding: 8px; border-radius: 5px; background-color: {color}20; border: 1px solid {color};">
-                                        <div style="font-size: 20px; font-weight: bold;">{value:.2f}</div>
-                                        <div style="font-size: 14px;">{name}</div>
-                                    </div>
-                                    """
-                                
-                                with cond_cols[0]:
-                                    st.markdown(signal_indicator(conditions.get('trend', 0), "Trend"), unsafe_allow_html=True)
-                                with cond_cols[1]:
-                                    st.markdown(signal_indicator(conditions.get('momentum', 0), "Momentum"), unsafe_allow_html=True)
-                                with cond_cols[2]:
-                                    st.markdown(signal_indicator(conditions.get('volume', 0), "Volume"), unsafe_allow_html=True)
-                            with cond_cols[3]:
-                                st.markdown(signal_indicator(conditions.get('sentiment', 0), "Sentiment"), unsafe_allow_html=True)
                             
-                            # Add conditional alert if close to trade
-                            if conditions.get('signal_strength', 0) > 0.4:
-                                st.markdown(f"""
-                                <div style="background-color: #FFC10720; border: 1px solid #FFC107; border-radius: 5px; padding: 10px; margin-top: 15px;">
-                                    <div style="display: flex; align-items: center;">
-                                        <span style="color: #FFC107; font-size: 20px; margin-right: 10px;">⚠️</span>
-                                        <span>Close to {signal_direction} trade signal - monitoring closely</span>
+                            # Add more details with improved styling
+                            details = st.expander("Auto-Trading Details", expanded=True)
+                            with details:
+                                metrics_table = """
+                                <table style="width: 100%; margin-bottom: 10px;">
+                                    <tr>
+                                        <td style="padding: 5px; font-weight: bold;">Last check:</td>
+                                        <td>{}</td>
+                                        <td style="padding: 5px; font-weight: bold;">Next check:</td>
+                                        <td>{}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 5px; font-weight: bold;">Cycles completed:</td>
+                                        <td>{}</td>
+                                        <td style="padding: 5px; font-weight: bold;">Trade opportunities:</td>
+                                        <td>{}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 5px; font-weight: bold;">Trades executed:</td>
+                                        <td>{}</td>
+                                        <td style="padding: 5px; font-weight: bold;"></td>
+                                        <td></td>
+                                    </tr>
+                                </table>
+                                """.format(
+                                    st.session_state.trading_stats['last_check'].strftime('%H:%M:%S') if st.session_state.trading_stats['last_check'] else 'N/A',
+                                    st.session_state.trading_stats['next_check'].strftime('%H:%M:%S') if st.session_state.trading_stats['next_check'] else 'N/A',
+                                    st.session_state.trading_stats['cycles_completed'],
+                                    st.session_state.trading_stats['potential_trades_found'],
+                                    st.session_state.trading_stats['trades_executed']
+                                )
+                                
+                                st.markdown(metrics_table, unsafe_allow_html=True)
+                                
+                                # Show current signal details with improved styling
+                                if st.session_state.trading_stats["trade_conditions"]:
+                                    conditions = st.session_state.trading_stats["trade_conditions"]
+                                    st.markdown("<h4 style='margin-top: 15px; margin-bottom: 10px;'>Current Signal Conditions</h4>", unsafe_allow_html=True)
+                                    
+                                    # Signal strength indicator
+                                    signal_strength = conditions.get('signal_strength', 0)
+                                    signal_direction = conditions.get('signal_direction', 'neutral')
+                                    signal_color = "green" if signal_direction == "bullish" else "red" if signal_direction == "bearish" else "gray"
+                                    
+                                    progress_value = min(signal_strength, 1.0)  # Cap at 1.0 for progress bar
+                                    
+                                    st.markdown(f"""
+                                    <div style="margin-bottom: 15px;">
+                                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                                            <span>Signal Strength: {signal_strength:.2f}</span>
+                                            <span>Direction: {signal_direction.title()}</span>
+                                        </div>
+                                        <div style="width: 100%; background-color: #333; height: 8px; border-radius: 4px;">
+                                            <div style="width: {progress_value * 100}%; background-color: {signal_color}; height: 8px; border-radius: 4px;"></div>
+                                        </div>
                                     </div>
-                                </div>
-                                """, unsafe_allow_html=True)
+                                    """, unsafe_allow_html=True)
+                                    
+                                    # Component signals with enhanced visuals
+                                    cond_cols = st.columns(4)
+                                    
+                                    def signal_indicator(value, name):
+                                        color = "#66BB6A" if value > 0.1 else "#EF5350" if value < -0.1 else "#78909C"
+                                        return f"""
+                                        <div style="text-align: center; padding: 8px; border-radius: 5px; background-color: {color}20; border: 1px solid {color};">
+                                            <div style="font-size: 20px; font-weight: bold;">{value:.2f}</div>
+                                            <div style="font-size: 14px;">{name}</div>
+                                        </div>
+                                        """
+                                    
+                                    with cond_cols[0]:
+                                        st.markdown(signal_indicator(conditions.get('trend', 0), "Trend"), unsafe_allow_html=True)
+                                    with cond_cols[1]:
+                                        st.markdown(signal_indicator(conditions.get('momentum', 0), "Momentum"), unsafe_allow_html=True)
+                                    with cond_cols[2]:
+                                        st.markdown(signal_indicator(conditions.get('volume', 0), "Volume"), unsafe_allow_html=True)
+                                with cond_cols[3]:
+                                    st.markdown(signal_indicator(conditions.get('sentiment', 0), "Sentiment"), unsafe_allow_html=True)
+                                
+                                # Add conditional alert if close to trade
+                                if conditions.get('signal_strength', 0) > 0.4:
+                                    st.markdown(f"""
+                                    <div style="background-color: #FFC10720; border: 1px solid #FFC107; border-radius: 5px; padding: 10px; margin-top: 15px;">
+                                        <div style="display: flex; align-items: center;">
+                                            <span style="color: #FFC107; font-size: 20px; margin-right: 10px;">⚠️</span>
+                                            <span>Close to {signal_direction} trade signal - monitoring closely</span>
+                                        </div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
             
             # Get current position section with enhanced UI
             st.markdown("<h3 style='margin-top: 20px;'>Position Management</h3>", unsafe_allow_html=True)

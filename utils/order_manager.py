@@ -155,13 +155,13 @@ class OrderManager:
         stop_price: Optional[float] = None
     ) -> Dict:
         """
-        Execute a trade.
+        Execute a trade with the specified parameters.
         
         Args:
             symbol: Symbol to trade
             qty: Quantity to trade
             side: 'buy' or 'sell'
-            order_type: Order type ('market', 'limit', 'stop_limit')
+            order_type: 'market', 'limit', or 'stop_limit'
             limit_price: Limit price for limit orders
             stop_price: Stop price for stop orders
             
@@ -176,8 +176,8 @@ class OrderManager:
                 "status": "rejected"
             }
             
-        # Ensure proper symbol format - Alpaca requires ETHUSD format (no slash)
-        symbol = symbol.replace('/', '')
+        # Keep the original symbol format for API calls
+        original_symbol = symbol
             
         # Get current account info to double-check balances
         try:
@@ -192,7 +192,7 @@ class OrderManager:
                 if not price:
                     # Try to get current price
                     try:
-                        position = self.alpaca.get_position(symbol)
+                        position = self.alpaca.get_position(original_symbol)
                         if position and hasattr(position, 'current_price'):
                             price = float(position.current_price)
                     except:
@@ -204,13 +204,13 @@ class OrderManager:
                     order_value = qty * price
                     # Add safety margin for market orders
                     if order_type.lower() == 'market':
-                        order_value *= 1.02  # Add 2% for market slippage
+                        order_value *= 1.03  # Add 3% for market slippage (increased from 2%)
                     
                     # Check if order exceeds buying power
                     if order_value > buying_power:
                         logger.warning(f"Order value (${order_value:.2f}) exceeds buying power (${buying_power:.2f}). Adjusting quantity.")
-                        # Calculate maximum quantity we can afford
-                        max_qty = (buying_power * 0.98) / price if price > 0 else 0
+                        # Calculate maximum quantity we can afford with a stronger safety margin
+                        max_qty = (buying_power * 0.97) / price if price > 0 else 0  # Increased safety from 0.98 to 0.97
                         
                         # If max_qty is too small, abort the order
                         if max_qty < 0.001 or max_qty * price < 5:
@@ -250,7 +250,7 @@ class OrderManager:
         if stop_price:
             price_info += f" with stop price {stop_price}"
             
-        logger.info(f"Submitting {order_type} {side} order for {qty} {symbol}{price_info}")
+        logger.info(f"Submitting {order_type} {side} order for {qty} {original_symbol}{price_info}")
         
         # Set up retry logic for insufficient balance errors
         max_retries = 3
@@ -260,7 +260,7 @@ class OrderManager:
             try:
                 # Submit order
                 order_params = {
-                    'symbol': symbol,
+                    'symbol': original_symbol,
                     'qty': current_qty,
                     'side': side,
                     'type': order_type
@@ -281,7 +281,7 @@ class OrderManager:
                     order_dict = {
                         'id': order.id if hasattr(order, 'id') else None,
                         'status': order.status if hasattr(order, 'status') else 'unknown',
-                        'symbol': order.symbol if hasattr(order, 'symbol') else symbol,
+                        'symbol': order.symbol if hasattr(order, 'symbol') else original_symbol,
                         'side': order.side if hasattr(order, 'side') else side,
                         'qty': order.qty if hasattr(order, 'qty') else current_qty,
                         'filled_avg_price': order.filled_avg_price if hasattr(order, 'filled_avg_price') else None
@@ -291,9 +291,9 @@ class OrderManager:
                 
                 # Log the result
                 if order_dict.get('status') == 'filled':
-                    logger.info(f"Order {order_dict.get('id')} filled: {side} {current_qty} {symbol} at {order_dict.get('filled_avg_price') or 'market price'}")
+                    logger.info(f"Order {order_dict.get('id')} filled: {side} {current_qty} {original_symbol} at {order_dict.get('filled_avg_price') or 'market price'}")
                 elif order_dict.get('status') == 'accepted' or order_dict.get('status') == 'new':
-                    logger.info(f"Order {order_dict.get('id')} accepted: {side} {current_qty} {symbol} (awaiting fill)")
+                    logger.info(f"Order {order_dict.get('id')} accepted: {side} {current_qty} {original_symbol} (awaiting fill)")
                 else:
                     logger.info(f"Order {order_dict.get('id')} status: {order_dict.get('status')}")
                     
@@ -328,10 +328,10 @@ class OrderManager:
                     }
                 
                 # Check if this is an insufficient balance error
-                if "insufficient balance" in error_msg and attempt < max_retries - 1:
+                if "insufficient" in error_msg and attempt < max_retries - 1:
                     # Decrease quantity more aggressively for each retry
-                    # First retry 80%, second retry 60% of original
-                    reduction_factor = 0.8 * (0.75 ** attempt)
+                    # First retry 75%, second retry 50% of original
+                    reduction_factor = 0.75 * (0.67 ** attempt)
                     current_qty = qty * reduction_factor
                     
                     # Make sure we're not trying a tiny order
@@ -342,7 +342,7 @@ class OrderManager:
                             "status": "rejected"
                         }
                         
-                    logger.warning(f"Insufficient balance error. Retrying with reduced quantity: {current_qty:.6f} {symbol} (attempt {attempt+1}/{max_retries})")
+                    logger.warning(f"Insufficient balance error. Retrying with reduced quantity: {current_qty:.6f} {original_symbol} (attempt {attempt+1}/{max_retries})")
                     continue
                 else:
                     # Extract helpful information from the error if possible
@@ -356,6 +356,14 @@ class OrderManager:
                             available = float(available_match.group(1))
                             requested = float(requested_match.group(1))
                             
+                            # Calculate a safe quantity and try one more time
+                            if price and attempt < max_retries - 1:
+                                safe_qty = (available * 0.95) / price  # Use 95% of available
+                                if safe_qty > 0.001 and safe_qty * price >= 5:
+                                    current_qty = safe_qty
+                                    logger.warning(f"Attempting one more time with quantity based on exact available balance: {current_qty:.6f}")
+                                    continue
+                            
                             logger.error(f"Order failed: requested ${requested:.2f} but only ${available:.2f} available")
                             return {
                                 "error": f"Insufficient balance: ${available:.2f} available, ${requested:.2f} required.",
@@ -363,7 +371,7 @@ class OrderManager:
                             }
                     
                     # Log and return error for other errors or if we've exhausted retries
-                    logger.error(f"Order execution failed for {side} {current_qty} {symbol}: {str(e)}", exc_info=True)
+                    logger.error(f"Order execution failed for {side} {current_qty} {original_symbol}: {str(e)}", exc_info=True)
                     return {
                         "error": str(e),
                         "status": "rejected" 
@@ -477,14 +485,14 @@ class OrderManager:
         """
         logger.info(f"Closing position for {symbol}")
         try:
-            # Ensure proper symbol format
-            formatted_symbol = symbol.replace('/', '')
+            # Keep original symbol format with slash
+            original_symbol = symbol
             
             # First, cancel all open orders for this symbol to prevent conflicts
             try:
-                logger.info(f"Canceling all open orders for {formatted_symbol} before closing position")
+                logger.info(f"Canceling all open orders for {original_symbol} before closing position")
                 # Get all open orders for this symbol
-                open_orders = self.alpaca.get_trades(symbol, limit=20, force_fresh=True)
+                open_orders = self.alpaca.get_trades(original_symbol, limit=20, force_fresh=True)
                 
                 # Cancel any open orders to avoid conflicts
                 canceled_orders = []
@@ -493,7 +501,7 @@ class OrderManager:
                     if hasattr(order, 'status') and order.status in ['new', 'accepted', 'pending_new', 'accepted_for_bidding']:
                         try:
                             if hasattr(order, 'id') and order.id:
-                                logger.info(f"Canceling order {order.id} for {formatted_symbol}")
+                                logger.info(f"Canceling order {order.id} for {original_symbol}")
                                 self.alpaca.trading_client.cancel_order(order.id)
                                 canceled_orders.append(order.id)
                         except Exception as cancel_error:
@@ -501,28 +509,28 @@ class OrderManager:
                 
                 # Add a small delay to allow the cancellations to process
                 if canceled_orders:
-                    logger.info(f"Canceled {len(canceled_orders)} open orders for {formatted_symbol}, waiting for processing")
+                    logger.info(f"Canceled {len(canceled_orders)} open orders for {original_symbol}, waiting for processing")
                     time.sleep(1.0)  # Increase delay to ensure cancellations process
             except Exception as cancel_error:
-                logger.warning(f"Error canceling open orders for {formatted_symbol}: {str(cancel_error)}")
+                logger.warning(f"Error canceling open orders for {original_symbol}: {str(cancel_error)}")
             
             # Try to get the current position to determine quantity
             try:
-                position = self.alpaca.get_position(formatted_symbol)
+                position = self.alpaca.get_position(original_symbol)
                 if position and hasattr(position, 'qty') and float(position.qty) > 0:
                     position_qty = float(position.qty)
-                    logger.info(f"Current position size for {formatted_symbol}: {position_qty}")
+                    logger.info(f"Current position size for {original_symbol}: {position_qty}")
                 else:
-                    logger.warning(f"No position found for {formatted_symbol}")
-                    return {"status": "no_position", "message": f"No position exists for {formatted_symbol}"}
+                    logger.warning(f"No position found for {original_symbol}")
+                    return {"status": "no_position", "message": f"No position exists for {original_symbol}"}
             except Exception as pos_error:
-                logger.warning(f"Error retrieving position for {formatted_symbol}: {str(pos_error)}")
+                logger.warning(f"Error retrieving position for {original_symbol}: {str(pos_error)}")
                 position_qty = None
             
             # Try the standard way first
             try:
                 # Now close the position
-                result = self.alpaca.close_position(formatted_symbol)
+                result = self.alpaca.close_position(original_symbol)
                 
                 # Convert result to dictionary if needed
                 if not isinstance(result, dict):
@@ -548,7 +556,7 @@ class OrderManager:
                     
                     # Try alternative approach: create a market sell order for the position quantity
                     try:
-                        logger.info(f"Attempting to close {formatted_symbol} position with market order, qty: {position_qty}")
+                        logger.info(f"Attempting to close {original_symbol} position with market order, qty: {position_qty}")
                         
                         # For crypto, we need to determine if this is a long or short position
                         # Assuming it's a long position (most common case)
@@ -556,7 +564,7 @@ class OrderManager:
                         
                         # Submit a market order to close the position
                         market_close = self.execute_trade(
-                            symbol=formatted_symbol,
+                            symbol=original_symbol,
                             qty=position_qty,
                             side=close_side,
                             order_type='market'
@@ -566,7 +574,7 @@ class OrderManager:
                         return {
                             'id': market_close.get('id'),
                             'status': market_close.get('status', 'executed'),
-                            'symbol': formatted_symbol,
+                            'symbol': original_symbol,
                             'side': close_side,
                             'qty': position_qty,
                             'method': 'market_order'

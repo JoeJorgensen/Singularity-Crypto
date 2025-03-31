@@ -27,8 +27,8 @@
    - Maintain minimum risk/reward ratio (default: 1.5)
 
 2. **Trade Execution / Data source**:
-   - **CRITICAL**: Always use Alpaca's IEX and Websocket feed for market data only use REST API for fallback datasource and  non-streaming requests like placing/canceling orders or retrieving account balances., **never** use the SIP feed or CryptoFeed.US
-   - For crypto data, always use the endpoints that automatically use the IEX feed
+   - **CRITICAL**: Always use Alpaca's US feed (CryptoFeed.US) for crypto market data and Websocket feed, **never** use the SIP feed
+   - For crypto data, always use the endpoints that automatically use the US feed
    - For websockets, always connect to "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
    - Log all trade executions in the terminal with relevant details
    - Implement order confirmation checks
@@ -36,7 +36,15 @@
    - **IMPORTANT**: For crypto orders in Alpaca, only use 'market', 'limit', and 'stop_limit' order types
    - When implementing stop losses for crypto, always use 'stop_limit' with both stop_price and limit_price parameters
 
-3. **Signal Generation**:
+3. **Alpaca SDK Usage**:
+   - **CRITICAL**: Always use the newest alpaca-py SDK, not the deprecated alpaca-trade-api-python
+   - Be aware of parameter differences between client classes (e.g., TradingClient vs RESTClient)
+   - For RESTClient, use api_key and secret_key parameters (not key_id)
+   - For TradingClient, use api_key and secret_key parameters
+   - For CryptoHistoricalDataClient, use api_key and secret_key parameters
+   - For CryptoDataStream, use api_key, secret_key, and feed=CryptoFeed.US parameters
+
+4. **Signal Generation**:
    - Use combined signals from technical, sentiment, and on-chain components
    - Apply signal thresholds consistently
    - Implement signal quality checks

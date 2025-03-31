@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 from dotenv import load_dotenv
 from api.coinlore_api import CoinloreAPI
+import random
 
 # Load environment variables
 load_dotenv()

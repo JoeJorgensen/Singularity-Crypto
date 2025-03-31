@@ -35,7 +35,7 @@ optuna>=3.3.0
 
 # UI enhancements
 streamlit-extras>=0.3.0
-streamlit-autorefresh==1.0.0
+streamlit-autorefresh==1.0.1
 streamlit-option-menu>=0.3.2
 streamlit-aggrid>=0.3.4
 
