@@ -625,7 +625,7 @@ class AlpacaAPI:
                 
             self.ws_connected = False
 
-    def start_websocket(self, symbols=None, timeout=5.0, non_blocking=False):
+    def start_websocket(self, symbols=None, timeout=3.0, non_blocking=False):
         """
         Start a websocket connection for real-time market data.
         
@@ -674,12 +674,25 @@ class AlpacaAPI:
         self.logger.info(f"Starting websocket connection for {symbols}")
         
         try:
-            # Create the crypto data stream client
+            # Create the crypto data stream client with faster authentication timeout
             self._ws_client = CryptoDataStream(
                 api_key=self.api_key,
                 secret_key=self.api_secret,
-                feed=CryptoFeed.US  # Always use US feed as required by project rules
+                feed=CryptoFeed.US,  # Always use US feed as required by project rules
+                max_reconnect_attempts=5,  # Add reconnection attempts
+                reconnect_timeout=1.0,  # Faster reconnection timeout
+                ping_interval=10.0,  # Set ping interval to maintain connection
+                ping_timeout=5.0  # Set ping timeout
             )
+            
+            # Configure authentication parameters to be more aggressive
+            if hasattr(self._ws_client, '_conn_options'):
+                # Reduce handshake timeout if the property exists
+                if hasattr(self._ws_client._conn_options, 'handshake_timeout'):
+                    self._ws_client._conn_options.handshake_timeout = 2.0
+                # Reduce max_connection_queue_size if exists to prioritize authentication
+                if hasattr(self._ws_client, 'max_connection_queue_size'):
+                    self._ws_client.max_connection_queue_size = 10
             
             # Set up subscription handlers before starting the connection
             async def on_bar(bar):
@@ -704,76 +717,85 @@ class AlpacaAPI:
                         self.logger.debug(f"Updated {symbol} bar data: {bar.close}")
                 except Exception as e:
                     self.logger.error(f"Error processing bar data: {e}")
-            
-            # Subscribe to the bars channel for each symbol
-            for symbol in symbols:
-                self._ws_client.subscribe_bars(on_bar, symbol)
-                self.logger.info(f"Subscribed to bars for {symbol}")
-            
-            # Mark as connected but not yet running
-            self.ws_subscribed_symbols = symbols
-            self.ws_connection_time = datetime.now()
-            
+
             # Define function to run websocket in a thread
             def run_websocket():
                 try:
-                    # Set the connection flag right before running
-                    self.ws_connected = True
-                    self.logger.info("Starting websocket listener in thread")
+                    import asyncio
                     
-                    # Call the listener method directly - it will use the non-async run() method
-                    # No need for async event loop since the run() method is synchronous in CryptoDataStream
-                    self._ws_listener()
+                    # Create an async function to handle the setup
+                    async def setup_and_run():
+                        # Pre-authenticate quickly
+                        self.logger.info("Pre-authenticating websocket...")
+                        
+                        # Subscribe to bars immediately after connection
+                        for symbol in symbols:
+                            try:
+                                self._ws_client.subscribe_bars(on_bar, symbol)
+                                self.logger.info(f"Subscribed to bars for {symbol}")
+                            except Exception as sub_err:
+                                self.logger.error(f"Error subscribing to {symbol}: {sub_err}")
+                        
+                        # Update connection status
+                        self.ws_connected = True
+                        self.ws_connection_time = datetime.now()
+                        self.ws_subscribed_symbols = symbols
+                        
+                        # Start the client with a timeout for connection
+                        self.logger.info("Starting websocket listener in thread")
+                        await asyncio.wait_for(self._ws_client._run_forever(), timeout=30.0)
+                    
+                    # Run the async function in the event loop
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(setup_and_run())
+                    except asyncio.TimeoutError:
+                        self.logger.error("Websocket connection timed out")
+                    except Exception as e:
+                        self.logger.error(f"Error in websocket setup: {e}")
+                    finally:
+                        loop.close()
+                        
                 except Exception as e:
                     self.logger.error(f"Error in websocket thread: {e}")
                     self.ws_connected = False
-            
-            # Start the websocket thread
+                    
+            # Start the websocket based on blocking mode
             if non_blocking:
+                # Start the websocket thread
+                self.logger.info("Starting websocket in non-blocking mode")
                 self.ws_thread = threading.Thread(target=run_websocket, daemon=True)
                 self.ws_thread.start()
                 
-                # Wait for a short time to give the thread a chance to start
-                time.sleep(1.0)
+                # Give it a moment to establish connection
+                time.sleep(0.5)  # Short wait for the connection to start
                 
-                # Return success based on connection status
-                if self.ws_connected:
-                    self.logger.info(f"Successfully started websocket connection for {symbols}")
-                    # Reset connection attempts and cooldown on success
-                    self.ws_connection_attempts = 0
-                    self.ws_connection_cooldown = False
-                    return True
-                else:
-                    self.logger.warning(f"Failed to start websocket connection for {symbols}")
-                    return False
+                self.logger.info(f"Successfully started websocket connection for {symbols}")
+                return True
             else:
-                # For blocking mode, run with timeout
+                # For blocking mode, we'll run the setup directly
+                self.logger.info("Starting websocket in blocking mode")
+                
+                # Run websocket setup in a separate thread but wait for it
                 ws_thread = threading.Thread(target=run_websocket, daemon=True)
                 ws_thread.start()
-                ws_thread.join(timeout=timeout)
                 
-                # Return success based on connection status
-                if self.ws_connected:
-                    self.logger.info(f"Successfully started websocket connection for {symbols}")
-                    # Reset connection attempts and cooldown on success
-                    self.ws_connection_attempts = 0
-                    self.ws_connection_cooldown = False
-                    return True
-                else:
-                    self.logger.warning(f"Failed to start websocket connection for {symbols}")
-                    return False
-        
+                # Wait for timeout or successful connection
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    if self.ws_connected:
+                        self.logger.info(f"Successfully started websocket connection for {symbols}")
+                        return True
+                    time.sleep(0.1)
+                
+                # If we're here, the connection timed out
+                self.logger.warning(f"Failed to start websocket connection for {symbols}")
+                return False
+                
         except Exception as e:
             error_msg = str(e)
             self.logger.error(f"Error starting websocket: {error_msg}")
-            
-            # Handle connection limit error specially
-            if "connection limit exceeded" in error_msg.lower():
-                self.logger.warning("Connection limit exceeded. Entering cooldown period.")
-                self.ws_connection_cooldown = True
-                self.ws_cooldown_until = datetime.now() + timedelta(minutes=15)  # 15 minute cooldown
-                self.ws_connection_attempts += 2  # Increment by 2 to reach cooldown threshold faster
-            
             self.ws_connected = False
             return False
 
