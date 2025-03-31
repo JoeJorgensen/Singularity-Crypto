@@ -911,6 +911,7 @@ class TradingStrategy:
             max_retries = 3
             retry_count = 0
             current_position_size = position_size
+            current_price = price  # Store price for retries
             
             while retry_count < max_retries:
                 try:
@@ -940,7 +941,7 @@ class TradingStrategy:
                                 "executed": False,
                                 "error": error_msg,
                                 "attempted_qty": current_position_size,
-                                "price": price
+                                "price": current_price
                             }
                     else:
                         # Order accepted, break out of retry loop
@@ -963,7 +964,7 @@ class TradingStrategy:
                             "executed": False,
                             "error": f"Trade execution error: {error_message}",
                             "attempted_qty": current_position_size,
-                            "price": price
+                            "price": current_price
                         }
             
             # Check if the order was successful
@@ -974,7 +975,7 @@ class TradingStrategy:
                     "executed": False,
                     "error": error_msg,
                     "attempted_qty": current_position_size,
-                    "price": price
+                    "price": current_price
                 }
             
             # Update last trade time ONLY on successful orders
