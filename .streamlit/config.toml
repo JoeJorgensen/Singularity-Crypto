@@ -1,0 +1,12 @@
+[server]
+enableCORS = false
+enableXsrfProtection = false
+maxUploadSize = 200
+maxMessageSize = 200
+enableWebsocketCompression = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark" 
