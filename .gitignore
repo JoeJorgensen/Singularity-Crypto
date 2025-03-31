@@ -11,3 +11,4 @@ credentials/
 *.log
 data/local/
 .streamlit/
+!.streamlit/config.toml
