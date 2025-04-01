@@ -305,13 +305,13 @@ class TechnicalIndicators:
         if 'volume' not in df.columns:
             logger.warning("Cannot add volume indicators: 'volume' column missing from DataFrame")
             # Add a default volume column with 0 values
-            df['volume'] = 0
+            df['volume'] = 0.0
             # Add placeholder zero values for volume indicators
-            df['obv'] = 0
-            df['vwap'] = df['close'] if 'close' in df.columns else 0
-            df['mfi'] = 50  # Neutral value
-            df['volume_sma20'] = 0
-            df['volume_osc'] = 0
+            df['obv'] = 0.0
+            df['vwap'] = df['close'] if 'close' in df.columns else 0.0
+            df['mfi'] = 50.0  # Neutral value
+            df['volume_sma20'] = 0.0
+            df['volume_osc'] = 0.0
             logger.info("Added placeholder volume indicators with neutral values")
             return df
             
@@ -373,9 +373,16 @@ class TechnicalIndicators:
         except Exception as e:
             logger.error(f"Error adding volume indicators: {str(e)}")
             # Add placeholder values if an error occurs
+            logger.info("Added placeholder volume indicators with neutral values")
             for indicator in ['obv', 'vwap', 'mfi', 'volume_sma20', 'volume_osc']:
                 if indicator not in df.columns:
-                    df[indicator] = 0 if indicator != 'mfi' else 50
+                    # Explicitly cast to float64 to avoid FutureWarning about dtype incompatibility
+                    df[indicator] = float(0 if indicator != 'mfi' else 50)
+            
+            # Add 'volume' column if it doesn't exist (helps prevent further errors)
+            if 'volume' not in df.columns:
+                df['volume'] = 0.0
+                
             return df
     
     @staticmethod
