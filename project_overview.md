@@ -86,8 +86,8 @@ CryptoTrading/
         "strong_buy": 0.5,
         "buy": 0.2,
         "neutral_band": 0.05,
-        "sell": -0.2,
-        "strong_sell": -0.5
+        "exit": -0.2,
+        "strong_exit": -0.5
     }
 }
 ```
@@ -176,3 +176,9 @@ The bot will continue to operate as long as:
 Users can modify settings in real-time through the Streamlit interface without needing to restart the application. All changes are applied immediately to the trading strategy while maintaining existing positions and risk management rules.
 
 This structure provides a complete, user-friendly automated trading system that can be configured and monitored through an intuitive interface while operating autonomously based on the user's preferences and risk parameters.
+
+## Trading Limitations
+* Cryptocurrency accounts at Alpaca are non-marginable and do not support short selling
+* The system only supports long positions (buy to open, sell to close)
+* All bearish signals are interpreted as exit signals for existing positions, not short entry signals
+* Risk management calculations are optimized for long-only strategy

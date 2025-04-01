@@ -279,7 +279,7 @@ class RiskManager:
         Args:
             entry_price: Entry price for the trade
             atr: Average True Range
-            direction: Trade direction ('long' or 'short')
+            direction: Trade direction (only 'long' is supported since crypto accounts are non-marginable)
             risk_reward_ratio: Override the default risk-reward ratio
             
         Returns:
@@ -291,12 +291,9 @@ class RiskManager:
         # Default ATR multiplier for stop loss
         atr_multiplier = 2.0
         
-        if direction.lower() == 'long':
-            stop_loss_price = entry_price - (atr * atr_multiplier)
-            take_profit_price = entry_price + (atr * atr_multiplier * risk_reward_ratio)
-        else:  # short
-            stop_loss_price = entry_price + (atr * atr_multiplier)
-            take_profit_price = entry_price - (atr * atr_multiplier * risk_reward_ratio)
+        # Only support long positions since crypto accounts are non-marginable and don't support short selling
+        stop_loss_price = entry_price - (atr * atr_multiplier)
+        take_profit_price = entry_price + (atr * atr_multiplier * risk_reward_ratio)
         
         return stop_loss_price, take_profit_price
     

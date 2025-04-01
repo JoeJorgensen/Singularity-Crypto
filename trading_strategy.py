@@ -683,7 +683,16 @@ class TradingStrategy:
         """
         symbol = symbol or self.default_pair
         side = signals.get('signal_direction', '').lower()
-        trade_direction = signals.get('components', {}).get('direction', 'long' if side == 'buy' else 'short' if side == 'sell' else 'none')
+        trade_direction = signals.get('components', {}).get('direction', 'long' if side == 'buy' else 'none')
+        
+        # Crypto accounts are non-marginable and don't support short selling
+        # We only support long positions (buy to open, sell to close)
+        if side == 'sell' and trade_direction == 'short':
+            logger.warning(f"Short selling not supported for crypto as accounts are non-marginable. Skipping trade.")
+            return {
+                "executed": False,
+                "error": "Short selling not supported for crypto. Only long positions are allowed."
+            }
         
         if not side or side not in ['buy', 'sell']:
             logger.error(f"Trade execution failed: Invalid side '{side}'")
@@ -716,7 +725,6 @@ class TradingStrategy:
             existing_position_value = 0
             existing_avg_entry = 0
             existing_current_price = 0
-            position_is_long = False
             
             try:
                 # Get detailed position information
@@ -727,59 +735,41 @@ class TradingStrategy:
                     existing_position_value = float(position.market_value)
                     existing_avg_entry = float(position.avg_entry_price) if hasattr(position, 'avg_entry_price') else 0
                     existing_current_price = float(position.current_price) if hasattr(position, 'current_price') else 0
-                    position_is_long = existing_position_size > 0
                     
                     # Calculate what percentage of portfolio this position represents
                     portfolio_allocation = existing_position_value / portfolio_value * 100 if portfolio_value > 0 else 0
                     
-                    position_type = "LONG" if position_is_long else "SHORT"
-                    logger.info(f"Existing {position_type} position found: {existing_position_size} {symbol} at avg entry ${existing_avg_entry:.2f}")
+                    logger.info(f"Existing LONG position found: {existing_position_size} {symbol} at avg entry ${existing_avg_entry:.2f}")
                     logger.info(f"Position value: ${existing_position_value:.2f} ({portfolio_allocation:.1f}% of portfolio)")
                     
-                    # Check if we need to close the existing position first due to opposite signal
-                    need_to_close_first = (side == 'buy' and not position_is_long) or (side == 'sell' and position_is_long)
+                    # If we're trying to sell but don't have a position to sell, report an error
+                    if side == 'sell' and existing_position_size <= 0:
+                        logger.warning(f"Cannot sell {symbol} - no long position exists to close.")
+                        return {
+                            "executed": False,
+                            "error": "No long position exists to close"
+                        }
                     
-                    if need_to_close_first:
-                        close_side = 'buy' if not position_is_long else 'sell'
-                        logger.info(f"Closing existing {position_type} position before opening new {'LONG' if side == 'buy' else 'SHORT'} position")
-                        
-                        # Close the existing position with a market order
-                        close_order = self.order_manager.execute_trade(
-                            symbol=symbol,
-                            side=close_side,
-                            qty=abs(existing_position_size),
-                            order_type="market"
-                        )
-                        
-                        if close_order.get('error'):
-                            logger.error(f"Failed to close existing position: {close_order.get('error')}")
-                            return {
-                                "executed": False,
-                                "error": f"Failed to close existing position: {close_order.get('error')}"
-                            }
-                        
-                        logger.info(f"Position closed: {close_order}")
-                        
-                        # Small delay to ensure the close order is processed
-                        time.sleep(0.5)
-                        
-                        # Reset position flags since we've closed it
-                        has_existing_position = False
-                        existing_position_size = 0
-                        existing_position_value = 0
-                    elif (side == 'buy' and position_is_long) or (side == 'sell' and not position_is_long):
-                        # If we already have a position in the same direction with significant allocation, don't add more
-                        if portfolio_allocation > 90:
-                            logger.warning(f"Position already represents {portfolio_allocation:.1f}% of portfolio - skipping additional {side}.")
-                            return {
-                                "executed": False,
-                                "error": f"Position already represents {portfolio_allocation:.1f}% of portfolio - adding more would be too concentrated."
-                            }
+                    # If we already have a position and are trying to buy more, check portfolio allocation limits
+                    if side == 'buy' and portfolio_allocation > 90:
+                        logger.warning(f"Position already represents {portfolio_allocation:.1f}% of portfolio - skipping additional {side}.")
+                        return {
+                            "executed": False,
+                            "error": f"Position already represents {portfolio_allocation:.1f}% of portfolio - adding more would be too concentrated."
+                        }
             except Exception as e:
                 error_msg = str(e).lower()
                 # Only log as warning if it's a 'position does not exist' error
                 if 'position does not exist' in error_msg:
                     logger.info(f"No existing position for {symbol} - proceeding with {side} order")
+                    
+                    # If trying to sell but no position exists, return error
+                    if side == 'sell':
+                        logger.warning(f"Cannot sell {symbol} - no position exists")
+                        return {
+                            "executed": False,
+                            "error": "No position exists to sell"
+                        }
                 else:
                     logger.warning(f"Error checking existing position: {str(e)}")
             
@@ -787,23 +777,22 @@ class TradingStrategy:
             # For buy (long) orders
             if side == 'buy':
                 # Use a fixed percentage of available buying power (95%)
-                # This is simpler than risk-based position sizing and avoids the conflict
                 safe_buy_amount = available_balance * 0.95
                 logger.info(f"Using 95% of buying power: ${safe_buy_amount:.2f} (from ${available_balance:.2f})")
             else:
-                # For sell (short) orders
-                if has_existing_position and position_is_long:
+                # For sell orders - this is selling an existing long position
+                if has_existing_position:
                     # This is closing an existing long position
                     position_sizing_balance = existing_position_value
                     safe_buy_amount = position_sizing_balance
                     logger.info(f"Selling entire position: {existing_position_size} {symbol} worth ${existing_position_value:.2f}")
                 else:
-                    # This is opening a new short position
-                    logger.info(f"Opening new short position for {symbol} with direction: {trade_direction}")
-                    
-                    # Use 95% of available buying power for shorts too
-                    safe_buy_amount = available_balance * 0.95
-                    logger.info(f"Using 95% of buying power for short: ${safe_buy_amount:.2f} (from ${available_balance:.2f})")
+                    # Cannot sell if no position exists
+                    logger.warning(f"Cannot sell {symbol} - no position exists")
+                    return {
+                        "executed": False,
+                        "error": "No position exists to sell"
+                    }
             
             # Check if user settings are available (look for a state file)
             strategy_mode = "Moderate"  # Default value
@@ -875,31 +864,14 @@ class TradingStrategy:
                         "error": f"Position value (${position_size * price:.2f}) is below minimum threshold of $10"
                     }
             else:
-                # Short position or close long
-                if has_existing_position and position_is_long:
-                    # Closing an existing long position - use exact position size
-                    position_size = existing_position_size
-                else:
-                    # Opening a new short position
-                    adjusted_price = price * 0.995  # Subtract 0.5% buffer
-                    position_size = safe_buy_amount / adjusted_price
-                    
-                    # Make sure the position size is not too small
-                    if position_size * price < 10:
-                        logger.warning(f"Short position value (${position_size * price:.2f}) is below minimum. Skipping trade.")
-                        return {
-                            "executed": False,
-                            "error": f"Short position value (${position_size * price:.2f}) is below minimum threshold of $10"
-                        }
+                # Selling an existing long position - use exact position size
+                position_size = existing_position_size
             
             # Log position sizing details
             if side == 'buy':
                 logger.info(f"Buy position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
             else:
-                if has_existing_position and position_is_long:
-                    logger.info(f"Sell existing long position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
-                else:
-                    logger.info(f"Open short position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
+                logger.info(f"Sell existing long position: {position_size:.6f} {symbol} at ${price:.2f} (value: ${position_size * price:.2f})")
             
             logger.info(f"Strategy mode: {strategy_mode}")
             
@@ -989,10 +961,7 @@ class TradingStrategy:
             if side == 'buy':
                 trade_action = "BUY (LONG)"
             else:
-                if has_existing_position and position_is_long:
-                    trade_action = "SELL (CLOSE LONG)"
-                else:
-                    trade_action = "SELL (SHORT)"
+                trade_action = "SELL (CLOSE LONG)"
             
             logger.info(f"Trade executed: {trade_action} {current_position_size} {symbol} at ~${price:.2f}")
             

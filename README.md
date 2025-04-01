@@ -68,6 +68,13 @@ Modify the `config/trading_config.json` file to customize:
 - Signal thresholds
 - UI settings
 
+## Trading Limitations
+
+- **Long-Only Trading**: This system only supports long positions (buy to open, sell to close) for cryptocurrencies
+- Cryptocurrency accounts at Alpaca are non-marginable and do not support short selling
+- All bearish signals are interpreted as exit signals for existing positions, not as short entry signals
+- Risk management and position sizing are optimized for long-only trading
+
 ## Disclaimer
 
 This trading bot is for educational purposes only. Use at your own risk. Always thoroughly test any trading strategy in a paper trading environment before using real funds. 

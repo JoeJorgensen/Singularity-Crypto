@@ -23,8 +23,8 @@
     "strong_buy": 0.5,
     "buy": 0.2,
     "neutral_band": 0.05,
-    "sell": -0.2,
-    "strong_sell": -0.5
+    "exit": -0.2,
+    "strong_exit": -0.5
   },
   "indicator_weights": {
     "trend": 0.4,

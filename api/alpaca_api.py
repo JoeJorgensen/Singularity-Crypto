@@ -1048,7 +1048,8 @@ class AlpacaAPI:
         Args:
             symbol: Symbol to trade
             qty: Quantity to trade
-            side: 'buy' or 'sell'
+            side: 'buy' or 'sell' (for crypto, 'sell' is only for closing existing long positions as 
+                  short selling is not supported)
             type: Order type ('market', 'limit', 'stop_limit')
             limit_price: Limit price for limit orders
             stop_price: Stop price for stop orders
@@ -1063,6 +1064,26 @@ class AlpacaAPI:
             # Sanity check - make sure qty is a positive number
             if qty <= 0:
                 raise ValueError(f"Invalid quantity: {qty}. Must be a positive number.")
+            
+            # For crypto, if side is 'sell', verify that a position exists to avoid unintended errors
+            # since crypto accounts don't support short selling
+            if side.lower() == 'sell':
+                try:
+                    position = self.get_position(symbol)
+                    if position is None or float(position.qty) <= 0:
+                        raise ValueError(
+                            f"Cannot sell {symbol} - no position exists. "
+                            "Cryptocurrency accounts do not support short selling. "
+                            "You must first have a long position to sell."
+                        )
+                except Exception as pos_error:
+                    if 'position does not exist' in str(pos_error).lower():
+                        raise ValueError(
+                            f"Cannot sell {symbol} - no position exists. "
+                            "Cryptocurrency accounts do not support short selling."
+                        )
+                    # If it's some other error checking the position, log but continue
+                    print(f"Warning: Could not verify position existence: {str(pos_error)}")
             
             # Double-check buying power for buy orders to prevent frequent errors
             if side.lower() == 'buy' and type.lower() in ['market', 'limit']:

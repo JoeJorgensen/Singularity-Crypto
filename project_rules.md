@@ -50,6 +50,12 @@
    - Implement signal quality checks
    - Log signal generation in the terminal with component contributions
 
+5. **Position Types**:
+   - **CRITICAL**: Cryptocurrency accounts at Alpaca are non-marginable and do not support short selling
+   - Only use 'buy' orders to enter long positions and 'sell' orders to exit long positions
+   - Never attempt to open short positions for cryptocurrencies 
+   - Interpret all bearish signals as exit signals for existing long positions, not as short entry signals
+
 ## Streamlit Application Rules
 
 1. **UI Components**:

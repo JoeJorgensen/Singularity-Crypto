@@ -536,19 +536,21 @@ class SignalGenerator:
         elif combined_signal >= self.buy:
             signal_name = 'buy'
         elif combined_signal <= self.strong_sell:
-            signal_name = 'strong_sell'
+            signal_name = 'exit'  # Changed from 'strong_sell' to 'exit' for long-only strategy
         elif combined_signal <= self.sell:
-            signal_name = 'sell'
+            signal_name = 'exit'  # Changed from 'sell' to 'exit' for long-only strategy
         else:
             signal_name = 'neutral'
         
-        # Determine direction and action
+        # Determine direction and action - modified for long-only strategy
+        # Since crypto accounts are non-marginable and don't support short selling,
+        # we only support 'buy' (enter long) or 'sell' (exit long) actions
         if signal_name in ['buy', 'strong_buy']:
             direction = 'long'
             action = 'buy'
-        elif signal_name in ['sell', 'strong_sell']:
-            direction = 'short'
-            action = 'sell'
+        elif signal_name in ['exit']:
+            direction = 'none'  # Changed from 'short' to 'none' since we can't short
+            action = 'sell'     # This means "exit the long position" not "short sell"
         else:
             direction = 'none'
             action = 'hold'
@@ -564,15 +566,9 @@ class SignalGenerator:
         stop_loss_percent = 0.03 * (1 - signal_strength * 0.5)  # 1.5-3% stop loss
         take_profit_percent = 0.06 * (1 + signal_strength * 0.5)  # 6-9% take profit
         
-        if direction == 'long':
-            stop_loss = current_price * (1 - stop_loss_percent)
-            take_profit = current_price * (1 + take_profit_percent)
-        elif direction == 'short':
-            stop_loss = current_price * (1 + stop_loss_percent)
-            take_profit = current_price * (1 - take_profit_percent)
-        else:
-            stop_loss = current_price * (1 - 0.03)  # Default 3% stop loss
-            take_profit = current_price * (1 + 0.06)  # Default 6% take profit
+        # Only calculate for long positions since we can't short crypto
+        stop_loss = current_price * (1 - stop_loss_percent)
+        take_profit = current_price * (1 + take_profit_percent)
         
         # Calculate risk-reward ratio
         if abs(current_price - stop_loss) > 0:

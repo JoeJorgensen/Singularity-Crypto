@@ -435,7 +435,7 @@ class OrderManager:
         Args:
             symbol: Symbol to trade
             qty: Quantity to trade
-            side: 'buy' or 'sell'
+            side: 'buy' or 'sell' (where 'sell' means closing a long position, not short selling)
             entry_price: Entry price (None for market price)
             stop_loss_price: Stop loss price
             take_profit_price: Take profit price
@@ -443,6 +443,9 @@ class OrderManager:
         Returns:
             Dictionary with order information
         """
+        # Note: Only long positions are supported since crypto accounts are non-marginable 
+        # and do not support short selling. 'sell' side here only means exiting an existing long position.
+        
         logger.info(f"Executing {side} order for {qty} {symbol} with risk management")
         if stop_loss_price:
             logger.info(f"Stop loss set at {stop_loss_price}")
@@ -465,21 +468,20 @@ class OrderManager:
             if main_order.get('status') in ['filled', 'accepted', 'new']:
                 # Create supporting orders for risk management
                 try:
-                    # Handle stop loss order
-                    if stop_loss_price:
-                        stop_side = 'sell' if side == 'buy' else 'buy'
-                        logger.info(f"Setting stop loss: {stop_side} {qty} {symbol} at {stop_loss_price}")
+                    # Handle stop loss order for long positions
+                    if stop_loss_price and side == 'buy':
+                        logger.info(f"Setting stop loss: sell {qty} {symbol} at {stop_loss_price}")
                         
                         try:
-                            # Calculate limit price slightly lower than stop price (for sell stop)
-                            # or slightly higher (for buy stop) to ensure order execution
-                            limit_price_offset = 0.99 if stop_side == 'sell' else 1.01
+                            # Calculate limit price slightly lower than stop price for sell stop
+                            # to ensure order execution
+                            limit_price_offset = 0.99
                             stop_limit_price = stop_loss_price * limit_price_offset
                             
                             stop_order = self.execute_trade(
                                 symbol=symbol,
                                 qty=qty,
-                                side=stop_side,
+                                side='sell',
                                 order_type='stop_limit',  # Use stop_limit instead of stop
                                 stop_price=stop_loss_price,
                                 limit_price=stop_limit_price  # Add limit price
@@ -488,16 +490,15 @@ class OrderManager:
                         except Exception as stop_error:
                             logger.error(f"Failed to create stop loss order: {str(stop_error)}")
                     
-                    # Handle take profit order
-                    if take_profit_price:
-                        take_profit_side = 'sell' if side == 'buy' else 'buy'
-                        logger.info(f"Setting take profit: {take_profit_side} {qty} {symbol} at {take_profit_price}")
+                    # Handle take profit order for long positions
+                    if take_profit_price and side == 'buy':
+                        logger.info(f"Setting take profit: sell {qty} {symbol} at {take_profit_price}")
                         
                         try:
                             take_profit_order = self.execute_trade(
                                 symbol=symbol,
                                 qty=qty,
-                                side=take_profit_side,
+                                side='sell',
                                 order_type='limit',
                                 limit_price=take_profit_price
                             )

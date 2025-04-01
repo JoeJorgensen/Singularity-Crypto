@@ -312,13 +312,10 @@ class PositionCalculator:
             if i == 0:
                 level_entry_price = entry_price
             else:
-                # Move entry price toward take profit for subsequent entries
-                if entry_price < take_profit_price:  # Long position
-                    distance = (take_profit_price - entry_price) / (num_positions + 1)
-                    level_entry_price = entry_price + (distance * i)
-                else:  # Short position
-                    distance = (entry_price - take_profit_price) / (num_positions + 1)
-                    level_entry_price = entry_price - (distance * i)
+                # Only support long positions since crypto accounts are non-marginable and don't support short selling
+                # Move entry price toward take profit for subsequent entries in a long position
+                distance = (take_profit_price - entry_price) / (num_positions + 1)
+                level_entry_price = entry_price + (distance * i)
             
             pyramid_positions.append({
                 "level": i + 1,
