@@ -596,12 +596,30 @@ class AlpacaAPI:
         try:
             self.logger.info("Connecting to Alpaca Crypto Websocket (US feed)...")
             
-            # Create the crypto data stream client
-            self._ws_client = CryptoDataStream(
-                api_key=self.api_key,
-                secret_key=self.api_secret,
-                feed="us"  # Use string value to avoid CryptoFeed.US compatibility issues
-            )
+            # Try to import CryptoFeed enum for more explicit feed selection
+            try:
+                from alpaca.data.enums import CryptoFeed
+                # Create the crypto data stream client with US feed (IEX)
+                self._ws_client = CryptoDataStream(
+                    api_key=self.api_key,
+                    secret_key=self.api_secret,
+                    feed=CryptoFeed.US  # Explicitly use IEX feed via enum
+                )
+                self.logger.info("Using CryptoFeed.US enum for IEX feed")
+            except ImportError:
+                # Fallback to string if enum is not available
+                self._ws_client = CryptoDataStream(
+                    api_key=self.api_key,
+                    secret_key=self.api_secret,
+                    feed="us"  # Use string value as fallback
+                )
+                self.logger.info("Using 'us' string for IEX feed (CryptoFeed enum not available)")
+            
+            # Add explicit debug log to confirm websocket URL
+            if hasattr(self._ws_client, '_ws_url'):
+                self.logger.info(f"Using websocket URL: {self._ws_client._ws_url}")
+            else:
+                self.logger.info("Using Alpaca US feed (IEX) for crypto websocket")
             
             # Set connected flag
             self.ws_connected = True
@@ -753,12 +771,24 @@ class AlpacaAPI:
         self.logger.info(f"Starting websocket connection for {symbols}")
         
         try:
-            # Create the crypto data stream client with faster authentication timeout
-            self._ws_client = CryptoDataStream(
-                api_key=self.api_key,
-                secret_key=self.api_secret,
-                feed="us"  # Use string value to avoid CryptoFeed.US compatibility issues
-            )
+            # Import CryptoFeed if available for more explicit feed selection
+            try:
+                from alpaca.data.enums import CryptoFeed
+                # Create the crypto data stream client with US feed (IEX)
+                self._ws_client = CryptoDataStream(
+                    api_key=self.api_key,
+                    secret_key=self.api_secret,
+                    feed=CryptoFeed.US  # Explicitly use IEX feed via enum
+                )
+                self.logger.info("Using CryptoFeed.US enum for IEX feed")
+            except ImportError:
+                # Fallback to string if enum is not available
+                self._ws_client = CryptoDataStream(
+                    api_key=self.api_key,
+                    secret_key=self.api_secret,
+                    feed="us"  # Use string value as fallback
+                )
+                self.logger.info("Using 'us' string for IEX feed (CryptoFeed enum not available)")
             
             # Configure authentication parameters to be more aggressive
             if hasattr(self._ws_client, '_conn_options'):
@@ -768,6 +798,12 @@ class AlpacaAPI:
                 # Reduce max_connection_queue_size if exists to prioritize authentication
                 if hasattr(self._ws_client, 'max_connection_queue_size'):
                     self._ws_client.max_connection_queue_size = 10
+            
+            # Add explicit debug log to confirm websocket URL
+            if hasattr(self._ws_client, '_ws_url'):
+                self.logger.info(f"Using websocket URL: {self._ws_client._ws_url}")
+            else:
+                self.logger.info("Using Alpaca US feed (IEX) for crypto websocket")
             
             # Set up subscription handlers before starting the connection
             async def on_bar(bar):
@@ -789,7 +825,12 @@ class AlpacaAPI:
                             'vwap': getattr(bar, 'vwap', 0),
                             'trade_count': getattr(bar, 'trade_count', 0)
                         }
-                        self.logger.debug(f"Updated {symbol} bar data: {bar.close}")
+                        # Log the price update more clearly for debugging
+                        self.logger.info(f"[WebSocket] Updated {symbol} price: ${bar.close} at {bar.timestamp}")
+                        
+                        # Also update the price cache for backup
+                        self.last_known_prices[symbol.replace('USD', '/USD')] = bar.close
+                        self.last_price_update_time[symbol.replace('USD', '/USD')] = datetime.now()
                 except Exception as e:
                     self.logger.error(f"Error processing bar data: {e}")
 
@@ -1623,6 +1664,7 @@ class AlpacaAPI:
         """
         import random
         import numpy as np
+        import pandas as pd  # Ensure pandas is imported locally within the method
         from datetime import datetime, timedelta
         
         # Determine number of data points based on period and timeframe

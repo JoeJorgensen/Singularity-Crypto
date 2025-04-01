@@ -873,25 +873,113 @@ def _process_trading_cycle_results(cycle_id, cycle_result, cycle_start_time):
 # Get market data with caching
 @st.cache_data(ttl=60)
 def get_crypto_data(_trading_strategy, timeframe='1H', limit=100):
-    """Get cryptocurrency market data for ETH/USD."""
+    """Get historical OHLCV data for the specified cryptocurrency."""
     try:
         # Always use ETH/USD
         symbol = 'ETH/USD'
         df = _trading_strategy.get_market_data(symbol, timeframe, limit)
         if df is not None and not df.empty:
-            # Update current price in session state
+            # Update current price in session state with more detailed logging
             if 'trading_stats' in st.session_state and len(df) > 0:
-                st.session_state.trading_stats["current_price"] = df['close'].iloc[-1]
+                current_price = df['close'].iloc[-1]
+                
+                # Log the price update for debugging
+                logger.info(f"Updating price from market data: ${current_price:.2f} (timeframe: {timeframe}, data points: {len(df)})")
+                
+                # Set the current price in session state
+                st.session_state.trading_stats["current_price"] = current_price
+                
+                # Also store the data source and timestamp
+                st.session_state.trading_stats["price_data_source"] = f"Alpaca API (timeframe: {timeframe})"
+                st.session_state.trading_stats["price_timestamp"] = datetime.now().strftime('%H:%M:%S')
+                
             return df
         else:
+            # Try to get current price from the API directly if DataFrame is empty
+            try:
+                if hasattr(_trading_strategy.apis['alpaca'], 'get_current_price'):
+                    current_price = _trading_strategy.apis['alpaca'].get_current_price(symbol)
+                    if current_price and 'trading_stats' in st.session_state:
+                        logger.info(f"Using direct API price: ${current_price:.2f} (fallback)")
+                        st.session_state.trading_stats["current_price"] = current_price
+                        st.session_state.trading_stats["price_data_source"] = "Alpaca API (direct)"
+                        st.session_state.trading_stats["price_timestamp"] = datetime.now().strftime('%H:%M:%S')
+                        
+                        # Create a minimal DataFrame with the current price
+                        minimal_df = pd.DataFrame({
+                            'open': [current_price],
+                            'high': [current_price],
+                            'low': [current_price],
+                            'close': [current_price],
+                            'volume': [0]
+                        }, index=[pd.Timestamp.now()])
+                        return minimal_df
+            except Exception as price_error:
+                logger.error(f"Error getting direct price: {str(price_error)}")
+                
             st.error("No data received from Alpaca API")
             return pd.DataFrame()
     except Exception as e:
         st.error(f"Error fetching market data: {str(e)}")
         return pd.DataFrame()
 
+def _show_mock_portfolio_chart():
+    """Show a mock portfolio chart when the real data cannot be loaded."""
+    import pandas as pd
+    from datetime import datetime, timedelta
+    import plotly.graph_objects as go
+    
+    # Create a placeholder empty chart with clear error message
+    dates = pd.date_range(start=datetime.now() - timedelta(days=30), end=datetime.now(), freq='D')
+    values = [10000 + i * 100 for i in range(len(dates))]
+    
+    # Create simple placeholder DataFrame
+    placeholder_df = pd.DataFrame({
+        'date': dates,
+        'value': values
+    })
+    
+    # Set index
+    placeholder_df.set_index('date', inplace=True)
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add line
+    fig.add_trace(
+        go.Scatter(
+            x=placeholder_df.index,
+            y=placeholder_df['value'],
+            mode='lines',
+            name='Portfolio Value (Sample)',
+            line=dict(width=2, color='#78909C', dash='dash'),
+            fill='tozeroy',
+            fillcolor='rgba(120, 144, 156, 0.1)'
+        )
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title="Portfolio Value Example (Sample Data)",
+        xaxis_title="Date",
+        yaxis_title="Value (USD)",
+        height=400,
+        template="plotly_dark",
+        margin=dict(l=10, r=10, t=40, b=10),
+        annotations=[{
+            'text': 'Error loading data. This is example data.',
+            'showarrow': False,
+            'xref': 'paper',
+            'yref': 'paper',
+            'x': 0.5,
+            'y': 0.5
+        }]
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
 def initialize_session_state():
-    """Initialize application session state with default values."""
+    """Initialize session state variables."""
     # Load persistent state or use defaults
     persistent_state = load_persistent_state()
     
@@ -1166,35 +1254,39 @@ def main():
                                     
                                     # Helper function to display a signal component
                                     def signal_indicator(value, name):
-                                        value_rounded = round(value, 2)
-                                        background_color = "#333333"
-                                        text_color = "#FFFFFF"
+                                        # Determine color based on value
+                                        if abs(value) < 0.1:  # Near neutral
+                                            color = "#888888"  # gray
+                                        elif value > 0.5:  # Strong positive
+                                            color = "#00FF00"  # bright green
+                                        elif value > 0.2:  # Positive
+                                            color = "#4CAF50"  # green
+                                        elif value < -0.5:  # Strong negative
+                                            color = "#FF0000"  # bright red
+                                        elif value < -0.2:  # Negative
+                                            color = "#F44336"  # red
+                                        elif value > 0:  # Slightly positive
+                                            color = "#8BC34A"  # light green
+                                        else:  # Slightly negative
+                                            color = "#FF9800"  # orange
                                         
-                                        if value > 0:
-                                            background_color = "#4CAF50"  # green
-                                        elif value < 0:
-                                            background_color = "#F44336"  # red
-                                            
-                                        return f"""
-                                        <div style="background-color: {background_color}; color: {text_color}; 
-                                                    padding: 10px; border-radius: 5px; text-align: center; margin-bottom: 5px;">
-                                            <div style="font-size: 18px; font-weight: bold;">{value_rounded}</div>
-                                            <div style="font-size: 12px;">{name}</div>
-                                        </div>
-                                        """
+                                        # Create a native Streamlit metric component with styling
+                                        st.markdown(f"<div style='text-align: center;'><span style='font-size: 0.8em; color: #888888;'>{name}</span><br>"
+                                                   f"<span style='font-size: 1.2em; font-weight: bold; color: {color};'>{value:.2f}</span></div>",
+                                                   unsafe_allow_html=True)
                                     
                                     # Display each component
                                     with component_cols[0]:
-                                        st.markdown(signal_indicator(conditions.get("trend", 0), "Trend"), unsafe_allow_html=True)
+                                        signal_indicator(conditions.get("trend", 0), "Trend")
                                     
                                     with component_cols[1]:
-                                        st.markdown(signal_indicator(conditions.get("momentum", 0), "Momentum"), unsafe_allow_html=True)
+                                        signal_indicator(conditions.get("momentum", 0), "Momentum")
                                     
                                     with component_cols[2]:
-                                        st.markdown(signal_indicator(conditions.get("volume", 0), "Volume"), unsafe_allow_html=True)
+                                        signal_indicator(conditions.get("volume", 0), "Volume")
                                     
                                     with component_cols[3]:
-                                        st.markdown(signal_indicator(conditions.get("sentiment", 0), "Sentiment"), unsafe_allow_html=True)
+                                        signal_indicator(conditions.get("sentiment", 0), "Sentiment")
 
                         # Reset the data updated flag after refreshing the UI
                         if hasattr(st.session_state, 'data_updated') and st.session_state.data_updated:
@@ -1306,24 +1398,24 @@ def main():
                     cash_percentage = (buying_power / portfolio_value) * 100
                     position_percentage = 100 - cash_percentage
                     
-                    # Add a visual indicator of portfolio allocation
-                    st.markdown(f"""
-                    <div style="margin-top: 10px;">
-                        <div style="font-size: 14px; margin-bottom: 5px;">Portfolio Allocation:</div>
-                        <div style="display: flex; height: 20px; border-radius: 4px; overflow: hidden;">
-                            <div style="width: {position_percentage}%; background-color: #4CAF50; height: 100%; display: flex; align-items: center; justify-content: center;">
-                                <span style="color: white; font-size: 12px; font-weight: bold;">{position_percentage:.1f}% Positions</span>
-                            </div>
-                            <div style="width: {cash_percentage}%; background-color: #2196F3; height: 100%; display: flex; align-items: center; justify-content: center;">
-                                <span style="color: white; font-size: 12px; font-weight: bold;">{cash_percentage:.1f}% Cash</span>
-                            </div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # Add a visual indicator of portfolio allocation using native components
+                    st.caption("Portfolio Allocation:")
+                    
+                    # Use Streamlit's progress bar for allocation visualization
+                    # Ensure the value is between 0 and 1
+                    progress_value = max(0.0, min(1.0, position_percentage / 100))
+                    st.progress(progress_value)
+                    
+                    # Add text explanation below the progress bar
+                    alloc_col1, alloc_col2 = st.columns(2)
+                    with alloc_col1:
+                        st.caption(f"Positions: {position_percentage:.1f}%")
+                    with alloc_col2:
+                        st.caption(f"Cash: {cash_percentage:.1f}%")
             except Exception as e:
                 st.error(f"Error retrieving account info: {str(e)}")
             
-            # Timeframe selection
+            # Define timeframe options for internal use (not displayed in UI)
             timeframe_options = {
                 "1 minute": "1Min",
                 "5 minutes": "5Min",
@@ -1332,31 +1424,10 @@ def main():
                 "4 hours": "4H",
                 "1 day": "1D"
             }
-            selected_timeframe = st.selectbox(
-                "Select Timeframe",
-                list(timeframe_options.keys()),
-                index=list(timeframe_options.keys()).index(st.session_state.selected_timeframe)
-                   if st.session_state.selected_timeframe in timeframe_options.keys() else 3
-            )
-            
-            # Update timeframe if changed
-            if selected_timeframe != st.session_state.selected_timeframe:
-                st.session_state.selected_timeframe = selected_timeframe
-                save_persistent_state({"selected_timeframe": selected_timeframe})
-            
-            # Number of candles
-            candle_options = [50, 100, 200, 500]
-            selected_candles = st.selectbox(
-                "Number of Candles", 
-                candle_options,
-                index=candle_options.index(st.session_state.selected_candles)
-                   if st.session_state.selected_candles in candle_options else 1
-            )
-            
-            # Update candles if changed
-            if selected_candles != st.session_state.selected_candles:
-                st.session_state.selected_candles = selected_candles
-                save_persistent_state({"selected_candles": selected_candles})
+            # Default to 1 minute timeframe if not set in session state
+            selected_timeframe = st.session_state.selected_timeframe if st.session_state.selected_timeframe in timeframe_options.keys() else "1 minute"
+            # Default to 100 candles if not set in session state
+            selected_candles = st.session_state.selected_candles if hasattr(st.session_state, 'selected_candles') else 100
             
             # Risk parameters 
             st.subheader("Risk Parameters")
@@ -1462,10 +1533,17 @@ def main():
                 with col1:
                     st.subheader("ETH/USD Price Chart")
                     
-                    # Create a placeholder for the chart that we can update
-                    chart_placeholder = st.empty()
+                    # Replace chart with TradingView widget
+                    st.markdown("""
+                    <div style="background-color: #1a1c24; border-radius: 10px; padding: 10px; margin-bottom: 20px;">
+                        <iframe 
+                            src="https://s.tradingview.com/widgetembed/?symbol=BINANCE%3AETHUSDT&interval=1&theme=dark&style=1&timezone=Etc%2FUTC&allow_symbol_change=false&studies=Volume@tv-basicstudies" 
+                            style="width: 100%; height: 600px; border: none; border-radius: 8px;"
+                        ></iframe>
+                    </div>
+                    """, unsafe_allow_html=True)
                     
-                    # Get market data
+                    # Get market data (still needed for signals)
                     df = get_crypto_data(
                         trading_strategy,
                         timeframe=timeframe_options[selected_timeframe],
@@ -1513,75 +1591,7 @@ def main():
                             from technical.indicators import TechnicalIndicators
                             df = TechnicalIndicators.add_all_indicators(df, config.get('technical_indicators', {}))
                         
-                        # Create price chart
-                        fig = go.Figure()
-                        
-                        # Add candlestick chart
-                        fig.add_trace(
-                            go.Candlestick(
-                                x=df.index,
-                                open=df['open'],
-                                high=df['high'],
-                                low=df['low'],
-                                close=df['close'],
-                                name='ETH/USD'
-                            )
-                        )
-                        
-                        # Add technical indicators
-                        if 'ema_20' in df.columns:
-                            fig.add_trace(
-                                go.Scatter(
-                                    x=df.index,
-                                    y=df['ema_20'],
-                                    name='EMA 20',
-                                    line=dict(width=1, color='rgba(13, 71, 161, 0.7)')
-                                )
-                            )
-                        
-                        if 'ema_50' in df.columns:
-                            fig.add_trace(
-                                go.Scatter(
-                                    x=df.index,
-                                    y=df['ema_50'],
-                                    name='EMA 50',
-                                    line=dict(width=1, color='rgba(187, 134, 252, 0.8)')
-                                )
-                            )
-                        
-                        if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
-                            fig.add_trace(
-                                go.Scatter(
-                                    x=df.index,
-                                    y=df['bb_upper'],
-                                    name='BB Upper',
-                                    line=dict(width=1, color='rgba(0, 200, 0, 0.5)'),
-                                    showlegend=True
-                                )
-                            )
-                            
-                            fig.add_trace(
-                                go.Scatter(
-                                    x=df.index,
-                                    y=df['bb_lower'],
-                                    name='BB Lower',
-                                    line=dict(width=1, color='rgba(200, 0, 0, 0.5)'),
-                                    showlegend=True
-                                )
-                            )
-                        
-                        # Update layout
-                        fig.update_layout(
-                            title=f"ETH/USD - {selected_timeframe}",
-                            yaxis_title="Price (USD)",
-                            xaxis_title="Time",
-                            height=600,
-                            template="plotly_dark",
-                            xaxis_rangeslider_visible=False,
-                            margin=dict(l=10, r=10, t=40, b=10)
-                        )
-                        
-                        chart_placeholder.plotly_chart(fig, use_container_width=True)
+                        # Skip creating the old price chart since we're using TradingView widget now
                         
                         # Get sentiment data
                         sentiment_data = trading_strategy.get_sentiment_data()
@@ -1703,7 +1713,19 @@ def main():
                             # Create a metrics display for auto-trading
                             metrics_cols = st.columns(2)
                             with metrics_cols[0]:
-                                st.metric("Current ETH Price", f"${st.session_state.trading_stats['current_price']:.2f}")
+                                # Show current price with more information about the data source
+                                price_value = st.session_state.trading_stats.get('current_price', 0)
+                                price_source = st.session_state.trading_stats.get('price_data_source', 'Unknown')
+                                price_timestamp = st.session_state.trading_stats.get('price_timestamp', '')
+                                
+                                # Create a more informative price display
+                                st.metric(
+                                    "Current ETH Price", 
+                                    f"${price_value:.2f}", 
+                                    delta=None, 
+                                    delta_color="normal"
+                                )
+                                st.caption(f"Source: {price_source} at {price_timestamp}")
                             with metrics_cols[1]:
                                 strategy_color = {
                                     "BUY opportunity": "green",
@@ -1761,54 +1783,42 @@ def main():
                                     signal_direction = conditions.get('signal_direction', 'neutral')
                                     signal_color = "green" if signal_direction == "bullish" else "red" if signal_direction == "bearish" else "gray"
                                     
-                                    progress_value = min(signal_strength, 1.0)  # Cap at 1.0 for progress bar
+                                    # Display signal details with native components
+                                    signal_cols = st.columns(2)
+                                    with signal_cols[0]:
+                                        st.caption("Signal Strength")
+                                        st.write(f"{signal_strength:.2f}")
+                                    with signal_cols[1]:
+                                        st.caption("Direction")
+                                        if signal_direction == "bullish":
+                                            st.success(signal_direction.title())
+                                        elif signal_direction == "bearish":
+                                            st.error(signal_direction.title())
+                                        else:
+                                            st.info(signal_direction.title())
                                     
-                                    st.markdown(f"""
-                                    <div style="margin-bottom: 15px;">
-                                        <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
-                                            <span>Signal Strength: {signal_strength:.2f}</span>
-                                            <span>Direction: {signal_direction.title()}</span>
-                                        </div>
-                                        <div style="width: 100%; background-color: #333; height: 8px; border-radius: 4px;">
-                                            <div style="width: {progress_value * 100}%; background-color: {signal_color}; height: 8px; border-radius: 4px;"></div>
-                                        </div>
-                                    </div>
-                                    """, unsafe_allow_html=True)
+                                    # Progress bar for signal strength
+                                    progress_value = min(max(0.0, signal_strength), 1.0)  # Ensure value is between 0 and 1
+                                    st.progress(progress_value)
                                     
                                     # Component signals with enhanced visuals
                                     cond_cols = st.columns(4)
                                     
-                                    def signal_indicator(value, name):
-                                        color = "#66BB6A" if value > 0.1 else "#EF5350" if value < -0.1 else "#78909C"
-                                        return f"""
-                                        <div style="text-align: center; padding: 8px; border-radius: 5px; background-color: {color}20; border: 1px solid {color};">
-                                            <div style="font-size: 20px; font-weight: bold;">{value:.2f}</div>
-                                            <div style="font-size: 14px;">{name}</div>
-                                        </div>
-                                        """
-                                    
                                     with cond_cols[0]:
-                                        st.markdown(signal_indicator(conditions.get('trend', 0), "Trend"), unsafe_allow_html=True)
+                                        st.metric("Trend", f"{conditions.get('trend', 0):.2f}")
                                     with cond_cols[1]:
-                                        st.markdown(signal_indicator(conditions.get('momentum', 0), "Momentum"), unsafe_allow_html=True)
+                                        st.metric("Momentum", f"{conditions.get('momentum', 0):.2f}")
                                     with cond_cols[2]:
-                                        st.markdown(signal_indicator(conditions.get('volume', 0), "Volume"), unsafe_allow_html=True)
-                                with cond_cols[3]:
-                                    st.markdown(signal_indicator(conditions.get('sentiment', 0), "Sentiment"), unsafe_allow_html=True)
+                                        st.metric("Volume", f"{conditions.get('volume', 0):.2f}")
+                                    with cond_cols[3]:
+                                        st.metric("Sentiment", f"{conditions.get('sentiment', 0):.2f}")
                                 
                                 # Add conditional alert if close to trade
                                 if conditions.get('signal_strength', 0) > 0.4:
-                                    st.markdown(f"""
-                                    <div style="background-color: #FFC10720; border: 1px solid #FFC107; border-radius: 5px; padding: 10px; margin-top: 15px;">
-                                        <div style="display: flex; align-items: center;">
-                                            <span style="color: #FFC107; font-size: 20px; margin-right: 10px;">⚠️</span>
-                                            <span>Close to {signal_direction} trade signal - monitoring closely</span>
-                                        </div>
-                                    </div>
-                                    """, unsafe_allow_html=True)
+                                    st.warning(f"⚠️ Close to {signal_direction} trade signal - monitoring closely")
             
             # Get current position section with enhanced UI
-            st.markdown("<h3 style='margin-top: 20px;'>Position Management</h3>", unsafe_allow_html=True)
+            st.subheader("Position Management")
             
             position_container = st.container()
             with position_container:
@@ -1817,7 +1827,7 @@ def main():
                     st.session_state.current_position = position
                     
                     if position:
-                        # Create a card-like appearance for position
+                        # Create a card-like appearance for position using native Streamlit components
                         position_qty = safe_position_value(position, 'qty')
                         avg_entry = safe_position_value(position, 'avg_entry_price')
                         current_price = safe_position_value(position, 'current_price')
@@ -1838,31 +1848,24 @@ def main():
                             logger.error(f"Error calculating position percentage: {str(e)}")
                             position_percentage = 0
                         
-                        # Determine color based on PnL
-                        position_color = "#66BB6A" if unrealized_pl > 0 else "#EF5350" if unrealized_pl < 0 else "#78909C"
+                        # Create position header
+                        st.subheader(f"Open Position: {position_qty} ETH ({position_percentage:.1f}% of portfolio)")
                         
-                        st.markdown(f"""
-                        <div style="background-color: {position_color}20; border: 1px solid {position_color}; border-radius: 10px; padding: 15px; margin-bottom: 20px;">
-                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                                <span style="font-size: 18px; font-weight: bold;">Open Position: {position_qty} ETH ({position_percentage:.1f}% of portfolio)</span>
-                                <span style="background-color: {position_color}; color: white; padding: 5px 10px; border-radius: 15px; font-weight: bold;">
-                                    {"PROFIT" if unrealized_pl > 0 else "LOSS" if unrealized_pl < 0 else "FLAT"}
-                                </span>
-                            </div>
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px;">
-                                <div style="text-align: center; padding: 8px; background-color: #ffffff10; border-radius: 5px;">
-                                    <div style="font-size: 14px; opacity: 0.7;">Entry Price</div>
-                                    <div style="font-size: 18px; font-weight: bold;">${avg_entry:.2f}</div>
-                                </div>
-                                <div style="text-align: center; padding: 8px; background-color: #ffffff10; border-radius: 5px;">
-                                    <div style="font-size: 14px; opacity: 0.7;">Current PnL</div>
-                                    <div style="font-size: 18px; font-weight: bold; color: {position_color};">
-                                        ${unrealized_pl:.2f} ({unrealized_plpc:.2f}%)
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        # Show PnL status with color
+                        if unrealized_pl > 0:
+                            st.success(f"Position Status: PROFIT (${unrealized_pl:.2f}, {unrealized_plpc:.2f}%)")
+                        elif unrealized_pl < 0:
+                            st.error(f"Position Status: LOSS (${unrealized_pl:.2f}, {unrealized_plpc:.2f}%)")
+                        else:
+                            st.info(f"Position Status: FLAT (${unrealized_pl:.2f}, {unrealized_plpc:.2f}%)")
+                            
+                        # Create two columns for position details
+                        pos_col1, pos_col2 = st.columns(2)
+                        with pos_col1:
+                            st.metric("Entry Price", f"${avg_entry:.2f}")
+                        with pos_col2:
+                            st.metric("Current PnL", f"${unrealized_pl:.2f}", f"{unrealized_plpc:.2f}%",
+                                      delta_color="normal" if unrealized_pl > 0 else "inverse")
                         
                         # Position management controls
                         col1, col2 = st.columns(2)
@@ -1969,21 +1972,11 @@ def main():
                                     st.error(f"Error setting stop loss: {str(e)}")
                                     logger.error(f"Error setting stop loss: {str(e)}", exc_info=True)
                     else:
-                        st.markdown("""
-                        <div style="background-color: #37474F; border-radius: 10px; padding: 20px; text-align: center; margin-bottom: 20px;">
-                            <div style="font-size: 16px; opacity: 0.7; margin-bottom: 5px;">No open position</div>
-                            <div style="font-size: 14px;">Place a new order or wait for auto-trading to enter a position</div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.info("No open position. Place a new order or wait for auto-trading to enter a position.")
                 except Exception as e:
                     error_msg = str(e).lower()
                     if 'position does not exist' in error_msg:
-                        st.markdown("""
-                        <div style="background-color: #37474F; border-radius: 10px; padding: 20px; text-align: center; margin-bottom: 20px;">
-                            <div style="font-size: 16px; opacity: 0.7; margin-bottom: 5px;">No open position</div>
-                            <div style="font-size: 14px;">Place a new order or wait for auto-trading to enter a position</div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.info("No open position. Place a new order or wait for auto-trading to enter a position.")
                     else:
                         st.error(f"Error retrieving position: {str(e)}")
                         logger.error(f"Error retrieving position: {str(e)}", exc_info=True)
@@ -2296,62 +2289,69 @@ def main():
                 )
                 
                 if valid_data:
-                    # Create DataFrame
-                    history_df = pd.DataFrame({
-                        'timestamp': pd.to_datetime(history['timestamp'], unit='s'),
-                        'equity': history['equity']
-                    })
-                    
-                    # Set index
-                    history_df.set_index('timestamp', inplace=True)
-                    
-                    # Create figure
-                    fig = go.Figure()
-                    
-                    # Add equity line
-                    fig.add_trace(
-                        go.Scatter(
-                            x=history_df.index,
-                            y=history_df['equity'],
-                            mode='lines',
-                            name='Portfolio Value',
-                            line=dict(width=2, color='#4CAF50'),
-                            fill='tozeroy',
-                            fillcolor='rgba(76, 175, 80, 0.1)'
+                    # Ensure pandas is available
+                    try:
+                        import pandas as pd
+                        # Create DataFrame
+                        history_df = pd.DataFrame({
+                            'timestamp': pd.to_datetime(history['timestamp'], unit='s'),
+                            'equity': history['equity']
+                        })
+                        
+                        # Set index
+                        history_df.set_index('timestamp', inplace=True)
+                        
+                        # Create figure
+                        fig = go.Figure()
+                        
+                        # Add equity line
+                        fig.add_trace(
+                            go.Scatter(
+                                x=history_df.index,
+                                y=history_df['equity'],
+                                mode='lines',
+                                name='Portfolio Value',
+                                line=dict(width=2, color='#4CAF50'),
+                                fill='tozeroy',
+                                fillcolor='rgba(76, 175, 80, 0.1)'
+                            )
                         )
-                    )
-                    
-                    # Update layout
-                    fig.update_layout(
-                        title="Portfolio Value Over Time",
-                        xaxis_title="Date",
-                        yaxis_title="Value (USD)",
-                        height=400,
-                        template="plotly_dark",
-                        margin=dict(l=10, r=10, t=40, b=10)
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Add some portfolio stats if available
-                    if len(history_df) > 1:
-                        try:
-                            # Calculate some basic portfolio stats
-                            total_return_pct = ((history_df['equity'].iloc[-1] / history_df['equity'].iloc[0]) - 1) * 100 if history_df['equity'].iloc[0] > 0 else 0
-                            highest_value = history_df['equity'].max()
-                            lowest_value = history_df['equity'].min()
-                            
-                            # Display stats in columns
-                            stat_cols = st.columns(3)
-                            with stat_cols[0]:
-                                st.metric("Period Return", f"{total_return_pct:.2f}%")
-                            with stat_cols[1]:
-                                st.metric("Highest Value", f"${highest_value:.2f}")
-                            with stat_cols[2]:
-                                st.metric("Lowest Value", f"${lowest_value:.2f}")
-                        except Exception as stats_err:
-                            logger.error(f"Error calculating portfolio stats: {str(stats_err)}")
-                            
+                        
+                        # Update layout
+                        fig.update_layout(
+                            title="Portfolio Value Over Time",
+                            xaxis_title="Date",
+                            yaxis_title="Value (USD)",
+                            height=400,
+                            template="plotly_dark",
+                            margin=dict(l=10, r=10, t=40, b=10)
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Add some portfolio stats if available
+                        if len(history_df) > 1:
+                            try:
+                                # Calculate some basic portfolio stats
+                                total_return_pct = ((history_df['equity'].iloc[-1] / history_df['equity'].iloc[0]) - 1) * 100 if history_df['equity'].iloc[0] > 0 else 0
+                                highest_value = history_df['equity'].max()
+                                lowest_value = history_df['equity'].min()
+                                
+                                # Display stats in columns
+                                stat_cols = st.columns(3)
+                                with stat_cols[0]:
+                                    st.metric("Period Return", f"{total_return_pct:.2f}%")
+                                with stat_cols[1]:
+                                    st.metric("Highest Value", f"${highest_value:.2f}")
+                                with stat_cols[2]:
+                                    st.metric("Lowest Value", f"${lowest_value:.2f}")
+                            except Exception as stats_err:
+                                logger.error(f"Error calculating portfolio stats: {str(stats_err)}")
+                    except Exception as pd_err:
+                        logger.error(f"Error loading pandas: {str(pd_err)}")
+                        st.warning("Could not load portfolio history due to data processing error.")
+                        _show_mock_portfolio_chart()
+                
                 else:
                     # Show a message about no data and create a placeholder chart
                     st.info("No portfolio history data is available. A placeholder chart is shown below.")
@@ -2404,7 +2404,7 @@ def main():
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
-                    
+            
             except Exception as e:
                 logger.error(f"Error loading portfolio history: {str(e)}")
                 st.warning("Could not load portfolio history. This is normal for new accounts or if no trades have been executed yet.")
@@ -2654,9 +2654,25 @@ def main():
                     </div>
                     """
                     
-                    # Use components.html instead of markdown for better rendering
-                    from streamlit.components.v1 import html
-                    html(trade_html, height=300)
+                    # Use DataFrame code
+                    import pandas as pd
+                    
+                    # Process trades into a dataframe
+                    trades_data = []
+                    for trade in st.session_state.recent_trades:
+                        # Process each trade for the dataframe
+                        trade_info = {
+                            "Date": trade_date,
+                            "Type": trade_type,
+                            "Size": f"{trade_size} ETH",
+                            "Price": trade_price,
+                            "Status": trade_status
+                        }
+                        trades_data.append(trade_info)
+                    
+                    # Display as dataframe
+                    trades_df = pd.DataFrame(trades_data)
+                    st.dataframe(trades_df, use_container_width=True, height=300)
                 else:
                     st.info("No recent trades found. Your executed trades will appear here.")
             except Exception as e:
@@ -2673,29 +2689,27 @@ def main():
             if not st.session_state.log_entries:
                 st.info("No log entries yet")
             else:
-                # Create a styled log display
-                log_html = """
-                <div style="background-color: #1E2127; border-radius: 10px; padding: 15px; margin-bottom: 20px; max-height: 400px; overflow-y: auto;">
-                    <table style="width: 100%; border-collapse: collapse;">
-                        <thead>
-                            <tr style="border-bottom: 1px solid #444;">
-                                <th style="padding: 8px; text-align: left;">Time</th>
-                                <th style="padding: 8px; text-align: left;">Level</th>
-                                <th style="padding: 8px; text-align: left;">Message</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                """
+                # Replace HTML code with dataframe
+                import pandas as pd
                 
+                # Convert log entries to a dataframe
+                log_data = []
                 for entry in st.session_state.log_entries[:20]:  # Show only last 20 entries
                     log_time = entry.get('timestamp').strftime('%H:%M:%S')
                     log_level = entry.get('level', 'INFO')
                     log_message = entry.get('message', '')
                     
-                    # Skip position does not exist error messages as they're normal when no position exists
+                    # Skip position does not exist error messages
                     if "position does not exist" in log_message.lower():
                         continue
                     
+                    log_data.append({
+                        "Time": log_time,
+                        "Level": log_level,
+                        "Message": log_message
+                    })
+                
+                # Display as dataframe
                     # Determine level color
                     level_color = {
                         "SUCCESS": "#4CAF50",
@@ -2754,14 +2768,7 @@ def main():
                     help="Default chart timeframe for analysis"
                 )
                 
-                # Default candles
-                default_candles = st.selectbox(
-                    "Default Number of Candles", 
-                    options=candle_options, 
-                    index=candle_options.index(st.session_state.selected_candles) 
-                        if st.session_state.selected_candles in candle_options else 1,
-                    help="Number of candles to display in charts"
-                )
+                
                 
                 # Strategy mode with radio buttons
                 strategy_mode = st.radio(
@@ -2803,11 +2810,7 @@ def main():
                 )
                 
                 # Note about 95% position sizing
-                st.markdown("""
-                <div style="background-color: #ff9800; color: black; padding: 10px; border-radius: 5px; margin-top: 20px;">
-                    <strong>Note:</strong> For optimal performance, position sizes are fixed at 95% of account value regardless of selected strategy.
-                </div>
-                """, unsafe_allow_html=True)
+                st.warning("For optimal performance, position sizes are fixed at 95% of account value regardless of selected strategy.")
             
             # Save button with clear action
             if st.button("Save All Settings", type="primary", use_container_width=True):
@@ -2815,7 +2818,7 @@ def main():
                     # Check if settings have changed
                     settings_changed = (
                         default_timeframe != st.session_state.selected_timeframe or
-                        default_candles != st.session_state.selected_candles or
+
                         strategy_mode != st.session_state.strategy_mode or
                         risk_per_trade != st.session_state.risk_per_trade or
                         max_trades_per_day != st.session_state.max_trades_per_day or
@@ -2826,7 +2829,7 @@ def main():
                         # Update session state with new settings
                         st.session_state.default_trading_pair = 'ETH/USD'  # Always use ETH/USD
                         st.session_state.selected_timeframe = default_timeframe
-                        st.session_state.selected_candles = default_candles
+
                         st.session_state.strategy_mode = strategy_mode
                         st.session_state.risk_per_trade = risk_per_trade
                         st.session_state.max_trades_per_day = max_trades_per_day
@@ -2836,7 +2839,7 @@ def main():
                         save_persistent_state({
                             "default_trading_pair": 'ETH/USD',  # Always save as ETH/USD
                             "selected_timeframe": default_timeframe,
-                            "selected_candles": default_candles,
+
                             "strategy_mode": strategy_mode,
                             "risk_per_trade": risk_per_trade,
                             "max_trades_per_day": max_trades_per_day,
