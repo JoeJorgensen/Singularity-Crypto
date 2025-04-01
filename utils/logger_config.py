@@ -71,14 +71,14 @@ class ColoredFormatter(logging.Formatter):
         
         return formatted_msg
 
-def setup_logging(log_level=logging.INFO, log_to_file=False, console_output=False):
+def setup_logging(log_level=logging.INFO, log_to_file=True, console_output=True):
     """
     Set up application logging with console and file handlers.
     
     Args:
         log_level: The logging level (default: logging.INFO)
-        log_to_file: Whether to log to file (default: False)
-        console_output: Whether to log to console (default: False)
+        log_to_file: Whether to log to file (default: True)
+        console_output: Whether to log to console (default: True)
     
     Returns:
         The configured root logger
@@ -157,8 +157,8 @@ def configure_module_loggers(log_level):
     order_logger = logging.getLogger('order_manager')
     order_logger.setLevel(log_level)
     
-    # API loggers - slightly less verbose
-    api_level = max(log_level, logging.INFO)  # At least INFO level
+    # API loggers - ensure they log at INFO level at minimum
+    api_level = min(log_level, logging.INFO)  # Always log INFO or more verbose
     for api in ['alpaca_api', 'finnhub_api', 'coinlore_api', 'openai_api']:
         api_logger = logging.getLogger(api)
         api_logger.setLevel(api_level)

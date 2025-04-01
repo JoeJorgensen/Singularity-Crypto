@@ -1,6 +1,6 @@
 {
   "trading": {
-    "supported_pairs": ["ETH/USD", "BTC/USD", "LTC/USD", "BCH/USD", "XRP/USD"],
+    "supported_pairs": ["ETH/USD"],
     "default_pair": "ETH/USD",
     "timeframe": "1h",
     "min_signal_strength": 0.12,

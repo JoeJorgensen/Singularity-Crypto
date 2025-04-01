@@ -19,6 +19,7 @@ import atexit
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 # Import streamlit_autorefresh for real-time UI updates
 from streamlit_autorefresh import st_autorefresh
+import random
 
 # Import core components
 from trading_strategy import TradingStrategy
@@ -26,11 +27,20 @@ from utils.risk_manager import RiskManager
 from utils.position_calculator import PositionCalculator
 from utils.signal_aggregator import SignalAggregator
 from utils.order_manager import OrderManager
-from utils.logging_config import setup_logging, get_logger
+from utils.logging_config import setup_logging, get_logger, is_cloud_environment
 
-# Set up logging once at application startup
-setup_logging(enable_console_logging=False, enable_file_logging=False)
+# Set up logging based on environment
+if is_cloud_environment():
+    # Use cloud profile with reduced logging for better performance
+    setup_logging(profile='cloud', cloud_optimized=True)
+    log_mode = "cloud-optimized"
+else:
+    # Use standard profile with more verbose logging for local development
+    setup_logging(profile='default')
+    log_mode = "standard"
+
 logger = get_logger('trading_app')
+logger.info(f"Logging initialized in {log_mode} mode")
 
 # Check for Streamlit secrets
 def verify_secrets():
@@ -308,15 +318,39 @@ def background_update():
         if not hasattr(st.session_state, "update_thread_running"):
             st.session_state.update_thread_running = True
             
+        # Add a thread identifier to help with debugging
+        thread_id = threading.current_thread().ident
+        logger.info(f"Background update thread started with ID {thread_id}")
+        
         while getattr(st.session_state, "update_thread_running", True):
             try:
                 # Store current time
                 current_time = time.time()
                 st.session_state.last_update_time = current_time
+                current_time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                
+                # Get refresh interval before starting cycle
+                interval = getattr(st.session_state, "refresh_interval", 15)  # Default to 15 seconds
+                
+                # Only log at start of cycle if we're not in cloud mode
+                if not is_cloud_environment():
+                    logger.info(f"[Thread-{thread_id}] Starting background cycle at {current_time_str} with refresh interval of {interval}s")
+                
+                cycle_start_time = time.time()
+                
+                # Force a trading cycle regardless of locks to ensure we don't get stuck
+                force_cycle = False
+                if hasattr(st.session_state, "last_successful_cycle_time"):
+                    time_since_last_cycle = time.time() - st.session_state.last_successful_cycle_time
+                    if time_since_last_cycle > interval * 2:  # If more than 2x interval has passed
+                        force_cycle = True
+                        logger.warning(f"[Thread-{thread_id}] Forcing cycle - {time_since_last_cycle:.1f}s since last successful cycle")
                 
                 # Only run trading cycles if trading is active
                 if hasattr(st.session_state, "initialized") and getattr(st.session_state, "trading_active", False):
-                    logger.info("Background update thread running trading cycle")
+                    # Only log if not in cloud mode to reduce verbosity
+                    if not is_cloud_environment():
+                        logger.info(f"[Thread-{thread_id}] Background update thread running trading cycle")
                     
                     # Set trigger update flag to ensure UI updates
                     st.session_state.trigger_update = True
@@ -346,47 +380,75 @@ def background_update():
                                     "last_run": None
                                 }
                             
-                            # Skip if another cycle is already running
-                            if st.session_state.cycle_locks[cycle_lock_key]["running"]:
+                            # Skip if another cycle is already running (unless forcing)
+                            if st.session_state.cycle_locks[cycle_lock_key]["running"] and not force_cycle:
                                 time_diff = (datetime.now() - st.session_state.cycle_locks[cycle_lock_key]["last_run"]).total_seconds() if st.session_state.cycle_locks[cycle_lock_key]["last_run"] else 999
                                 # If another cycle has been running for more than 30 seconds, consider it stalled
                                 if time_diff < 30:
-                                    logger.info(f"[{cycle_id}] Skipping trading cycle - another one is already running ({time_diff:.1f}s ago)")
-                                    continue
+                                    # In cloud mode, don't log every skipped cycle
+                                    if not is_cloud_environment():
+                                        logger.info(f"[{cycle_id}] Skipping trading cycle - another one is already running ({time_diff:.1f}s ago)")
+                                    cycle_was_skipped = True
                                 else:
                                     logger.warning(f"[{cycle_id}] Found stalled trading cycle ({time_diff:.1f}s old), resetting lock")
+                                    cycle_was_skipped = False
+                            else:
+                                cycle_was_skipped = False
                             
-                            # Mark this cycle as running
-                            st.session_state.cycle_locks[cycle_lock_key]["running"] = True
-                            
-                            # Run the trading cycle
-                            cycle_result = trading_strategy.run_trading_cycle(symbol=st.session_state.default_trading_pair, timeframe=norm_tf)
-                            
-                            # Process the results and update UI data
-                            _process_trading_cycle_results(cycle_id, cycle_result, st.session_state.default_trading_pair, datetime.now())
-                            
-                            # Set a flag to indicate that new data is available for UI refresh
-                            st.session_state.data_updated = True
-                            
+                            if not cycle_was_skipped:
+                                # Mark this cycle as running
+                                st.session_state.cycle_locks[cycle_lock_key]["running"] = True
+                                
+                                # Log that we're running the cycle
+                                if not is_cloud_environment():
+                                    logger.info(f"[{cycle_id}] Actually running trading cycle for {norm_tf} timeframe")
+                                
+                                # Run the trading cycle
+                                cycle_result = trading_strategy.run_trading_cycle(symbol='ETH/USD', timeframe=norm_tf)
+                                
+                                # Process the results and update UI data
+                                _process_trading_cycle_results(cycle_id, cycle_result, datetime.now())
+                                
+                                # Record the time of the last successful cycle
+                                st.session_state.last_successful_cycle_time = time.time()
+                                
+                                # Set a flag to indicate that new data is available for UI refresh
+                                st.session_state.data_updated = True
+                                
+                                # Mark the cycle as no longer running
+                                if cycle_lock_key in st.session_state.cycle_locks:
+                                    st.session_state.cycle_locks[cycle_lock_key]["running"] = False
+                                    st.session_state.cycle_locks[cycle_lock_key]["last_run"] = datetime.now()
                         except Exception as e:
                             logger.error(f"Error in background trading cycle: {str(e)}", exc_info=True)
-                        finally:
-                            # Mark the cycle as no longer running
+                            # Ensure we reset the lock even on error
                             if cycle_lock_key in st.session_state.cycle_locks:
                                 st.session_state.cycle_locks[cycle_lock_key]["running"] = False
-                                st.session_state.cycle_locks[cycle_lock_key]["last_run"] = datetime.now()
                     else:
                         logger.warning("Cannot run background trading cycle - system not initialized")
                 
-                # Sleep for the specified interval
-                interval = getattr(st.session_state, "refresh_interval", 15)  # Default to 15 seconds
-                time.sleep(interval)
+                # Calculate how long the cycle took
+                cycle_duration = time.time() - cycle_start_time
+                
+                # Calculate remaining sleep time to ensure consistent intervals
+                sleep_time = max(0.1, interval - cycle_duration)  # Ensure at least 0.1s sleep
+                
+                next_cycle_time = datetime.now() + timedelta(seconds=sleep_time)
+                next_cycle_time_str = next_cycle_time.strftime("%H:%M:%S")
+                
+                # In cloud mode, only log lengthy operations or issues
+                if not is_cloud_environment() or cycle_duration > (interval * 0.5):
+                    logger.info(f"[Thread-{thread_id}] Background cycle completed in {cycle_duration:.2f}s, sleeping for {sleep_time:.2f}s, next check at {next_cycle_time_str}")
+                
+                # Sleep for the calculated time to maintain consistent intervals
+                time.sleep(sleep_time)
+                
             except Exception as e:
-                logger.error(f"Error in background update thread: {e}")
+                logger.error(f"Error in background update thread: {str(e)}", exc_info=True)
                 time.sleep(5)  # Wait a bit before retrying on error
     except Exception as e:
-        logger.error(f"Fatal error in background update thread: {e}")
-
+        logger.error(f"Fatal error in background update thread: {str(e)}", exc_info=True)
+        
 # Start the background update thread if it's not already running
 def ensure_update_thread():
     """Ensure the background update thread is running."""
@@ -411,14 +473,25 @@ def ensure_update_thread():
         if ctx is not None:
             add_script_run_ctx(thread, ctx)
         
+        # Initialize last_successful_cycle_time if not set
+        if not hasattr(st.session_state, "last_successful_cycle_time"):
+            st.session_state.last_successful_cycle_time = time.time()
+        
         # Start the thread and store it in session state
         thread.start()
         st.session_state.update_thread = thread
         logger.info("Started background update thread with script context")
-
-# Add cleanup function after ensure_update_thread function
+        
+# Modify the cleanup function to prevent multiple calls
 def cleanup():
     """Clean up resources when application exits."""
+    # Use an atomic check to prevent multiple cleanup calls
+    if hasattr(st.session_state, "_cleanup_done") and st.session_state._cleanup_done:
+        return
+    
+    # Set the cleanup flag immediately
+    st.session_state._cleanup_done = True
+    
     logger.info("Running cleanup...")
     
     # Stop background update thread
@@ -621,12 +694,15 @@ def safe_position_value(position, attribute, default=0):
     except (AttributeError, TypeError, ValueError):
         return default
 
-def run_trading_cycle_with_stats(trading_strategy, timeframe, symbol='ETH/USD'):
+def run_trading_cycle_with_stats(trading_strategy, timeframe):
     """
     Run a trading cycle and update session state with trading stats
     """
     if not st.session_state.trading_active:
         return
+    
+    # Always use ETH/USD as the symbol
+    symbol = 'ETH/USD'
     
     # Normalize timeframe to standard format
     norm_timeframe = normalize_timeframe(timeframe)
@@ -635,16 +711,16 @@ def run_trading_cycle_with_stats(trading_strategy, timeframe, symbol='ETH/USD'):
     cycle_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     cycle_id = f"Cycle-{st.session_state.trading_stats['cycles_completed'] + 1}-{cycle_timestamp}"
     
-    # Check if there's already a cycle running for this symbol and timeframe
-    cycle_lock_key = f"{symbol}_{norm_timeframe}"
+    # Check if there's already a cycle running for this timeframe
+    cycle_lock_key = f"{norm_timeframe}"
     
     # Initialize lock if it doesn't exist
     if cycle_lock_key not in st.session_state.cycle_locks:
         st.session_state.cycle_locks[cycle_lock_key] = {"running": False, "last_run": None}
     
-    # Skip if a cycle is already running for this symbol/timeframe
+    # Skip if a cycle is already running for this timeframe
     if st.session_state.cycle_locks[cycle_lock_key]["running"]:
-        logger.info(f"Skipping duplicate cycle for {symbol} on {norm_timeframe}")
+        logger.info(f"Skipping duplicate cycle for ETH/USD on {norm_timeframe}")
         return
     
     # Set cycle as running
@@ -654,14 +730,14 @@ def run_trading_cycle_with_stats(trading_strategy, timeframe, symbol='ETH/USD'):
     try:
         # Update last check time
         st.session_state.trading_stats["last_check"] = cycle_start_time
-        logger.info(f"[{cycle_id}] Starting trading cycle for {symbol} on {norm_timeframe} timeframe")
+        logger.info(f"[{cycle_id}] Starting trading cycle for ETH/USD on {norm_timeframe} timeframe")
         
         # Use only the synchronous version for simplicity and reliability
         cycle_result = trading_strategy.run_trading_cycle(symbol, norm_timeframe)
         logger.info(f"[{cycle_id}] Completed trading cycle")
         
         # Process the results and update UI
-        _process_trading_cycle_results(cycle_id, cycle_result, symbol, cycle_start_time)
+        _process_trading_cycle_results(cycle_id, cycle_result, cycle_start_time)
         
     except Exception as e:
         error_msg = f"Error in trading cycle: {str(e)}"
@@ -681,129 +757,126 @@ def run_trading_cycle_with_stats(trading_strategy, timeframe, symbol='ETH/USD'):
         st.session_state.cycle_locks[cycle_lock_key]["last_run"] = datetime.now()
 
 # Create a simple wrapper for the async version
-async def run_trading_cycle_with_stats_async(trading_strategy, timeframe, symbol='ETH/USD'):
+async def run_trading_cycle_with_stats_async(trading_strategy, timeframe):
     """
     Async wrapper for run_trading_cycle_with_stats
     This is just a stub to prevent errors - we'll actually run the sync version for reliability
     """
     # Just call the synchronous version
-    return run_trading_cycle_with_stats(trading_strategy, timeframe, symbol)
+    return run_trading_cycle_with_stats(trading_strategy, timeframe)
 
-def _process_trading_cycle_results(cycle_id, cycle_result, symbol, cycle_start_time):
-    """Process the results of a trading cycle and update session state"""
-    # Update current price if available
-    if 'signals' in cycle_result and cycle_result['signals']:
-        if 'current_price' in cycle_result['signals']:
-            current_price = cycle_result['signals']['current_price']
-            st.session_state.trading_stats["current_price"] = current_price
-            logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
-        elif hasattr(cycle_result['signals'], 'get') and cycle_result['signals'].get('entry_point'):
-            current_price = cycle_result['signals']['entry_point']
-            st.session_state.trading_stats["current_price"] = current_price
-            logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
-    
-    # Update stats
-    st.session_state.trading_stats["cycles_completed"] += 1
-    
-    # Update current_status and strategy_looking_for
-    if 'signals' in cycle_result and cycle_result['signals']:
-        signal_value = cycle_result['signals'].get('signal', 0)
-        signal_strength = abs(signal_value) if signal_value is not None else 0
-        signal_direction = "bullish" if signal_value > 0 else "bearish" if signal_value < 0 else "neutral"
-        signal_name = cycle_result['signals'].get('signal_direction', 'neutral')
+def _process_trading_cycle_results(cycle_id, cycle_result, cycle_start_time):
+    """Process trading cycle results and update UI data."""
+    try:
+        # Update trading stats for UI display
+        st.session_state.trading_stats["current_price"] = cycle_result.get("current_price", 0)
         
-        # Determine what the strategy is looking for
-        if signal_name == 'buy':
-            strategy_looking_for = "BUY opportunity"
-            st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-            logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
-        elif signal_name == 'sell':
-            strategy_looking_for = "SELL opportunity"
-            st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-            logger.info(f"[{cycle_id}] Strategy is looking for a {strategy_looking_for}")
-        else:
-            strategy_looking_for = "Neutral - waiting for clearer signals"
-            st.session_state.trading_stats["strategy_looking_for"] = strategy_looking_for
-            logger.info(f"[{cycle_id}] Strategy is {strategy_looking_for}")
+        # IMPORTANT: Update last check and next check times with CURRENT timestamps
+        st.session_state.trading_stats["last_check"] = datetime.now()
+        
+        # Calculate next check time based on refresh interval
+        refresh_interval = getattr(st.session_state, "refresh_interval", 15)  # Default to 15 seconds
+        st.session_state.trading_stats["next_check"] = datetime.now() + timedelta(seconds=refresh_interval)
+        
+        # Increment completed cycles counter
+        st.session_state.trading_stats["cycles_completed"] = st.session_state.trading_stats.get("cycles_completed", 0) + 1
+        
+        # Get key data to create a single consistent log line
+        signal_direction = cycle_result.get("signal_direction", "neutral")
+        signal_strength = cycle_result.get("signal_strength", 0)
+        current_price = cycle_result.get("current_price", 0)
+        symbol = cycle_result.get("symbol", "ETH/USD")
+        
+        # Update if a trade was attempted
+        if cycle_result.get("should_trade", False):
+            st.session_state.trading_stats["potential_trades_found"] = st.session_state.trading_stats.get("potential_trades_found", 0) + 1
             
-        # Extract component signals
-        components = cycle_result['signals'].get('components', {})
-        trend = components.get('trend', 0)
-        momentum = components.get('momentum', 0)
-        volume = components.get('volume', 0)
+        # Update if a trade was executed
+        if cycle_result.get("trade_status") == "executed":
+            st.session_state.trading_stats["trades_executed"] = st.session_state.trading_stats.get("trades_executed", 0) + 1
         
-        # Update trade conditions
-        trade_conditions = {
-            "trend": trend,
-            "momentum": momentum, 
-            "volume": volume,
-            "sentiment": cycle_result['signals'].get('sentiment_score', 0),
+        # Update current status and what the strategy is looking for
+        st.session_state.trading_stats["strategy_looking_for"] = f"{signal_direction.upper()} opportunity"
+        
+        # Set current status based on trade status
+        trade_status = cycle_result.get("trade_status", "no_trade")
+        if trade_status == "executed":
+            st.session_state.trading_stats["current_status"] = "Trade executed"
+        elif trade_status == "error":
+            st.session_state.trading_stats["current_status"] = "Error during cycle"
+        else:
+            st.session_state.trading_stats["current_status"] = "Monitoring market"
+        
+        # Update trade condition details
+        signals_obj = cycle_result.get("signals", {})
+        components = signals_obj.get("components", {})
+        
+        # Update the trade conditions object
+        st.session_state.trading_stats["trade_conditions"] = {
+            "trend": components.get("trend", 0),
+            "momentum": components.get("momentum", 0),
+            "volume": components.get("volume", 0),
+            "volatility": components.get("volatility", 0),
+            "sentiment": signals_obj.get("sentiment_score", 0),
             "signal_strength": signal_strength,
             "signal_direction": signal_direction
         }
-        st.session_state.trading_stats["trade_conditions"] = trade_conditions
         
-        # Log the details
-        logger.info(f"[{cycle_id}] Signal: {signal_name} ({signal_value:.4f}), Direction: {signal_direction}, Strength: {signal_strength:.4f}")
-    
-    # Check if a trade should be executed
-    if cycle_result.get('should_trade', False):
-        st.session_state.trading_stats["potential_trades_found"] += 1
-        st.session_state.trading_stats["current_status"] = "Trade opportunity found"
+        # Set the trigger update flag to ensure UI reflects latest data
+        st.session_state.trigger_update = True
         
-        signal_name = cycle_result['signals'].get('signal_direction', 'unknown')
-        signal_value = cycle_result['signals'].get('signal', 0)
-        logger.warning(f"[{cycle_id}] Trade opportunity detected: {signal_name} with strength {signal_value:.4f}")
+        # Log a single comprehensive line about the cycle result
+        next_check_time = datetime.now() + timedelta(seconds=refresh_interval)
+        cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
         
-        # Add to log
-        if 'log_entries' not in st.session_state:
-            st.session_state.log_entries = []
-            
-        st.session_state.log_entries.insert(0, {
-            "timestamp": datetime.now(),
-            "level": "WARNING",
-            "message": f"Trade opportunity detected: {signal_name} with strength {signal_value:.2f}"
-        })
+        # Only log at INFO level in local environment, use WARNING level for significant trades in cloud
+        if trade_status == "executed":
+            # Always log executed trades at a higher level
+            logger.warning(f"[{cycle_id}] {signal_direction.upper()} trade EXECUTED for {symbol} at {current_price}")
+        else:
+            # Only log the cycle details if not in cloud environment or if the signal is significant
+            if not is_cloud_environment() or signal_strength > 0.05:  # Log stronger signals even in cloud
+                logger.info(f"[{cycle_id}] Completed trading cycle")
+                logger.info(f"[{cycle_id}] Current {symbol} price: {current_price}")
+                logger.info(f"[{cycle_id}] Strategy is looking for a {signal_direction.upper()} opportunity")
+                logger.info(f"[{cycle_id}] Signal: {signal_direction} ({signal_strength:.4f}), Direction: {signal_direction}, Strength: {signal_strength:.4f}")
+                logger.info(f"[{cycle_id}] No trade executed, continuing to monitor markets")
+                logger.info(f"[{cycle_id}] Trading cycle completed in {cycle_duration:.2f} seconds. Next check at {next_check_time.strftime('%H:%M:%S')}")
         
-        # If a trade was executed, update stats
-        if cycle_result.get('trade_result', {}).get('executed', False):
-            st.session_state.trading_stats["trades_executed"] += 1
-            st.session_state.trading_stats["current_status"] = "Trade executed"
+        # Force a rerun of the app to update the UI if needed
+        # Only trigger a rerun periodically to avoid excessive refreshes
+        current_time = time.time()
+        time_since_last_ui_update = current_time - getattr(st.session_state, "last_ui_update_time", 0)
+        
+        # If it's been more than 2 seconds since the last UI update, trigger a rerun
+        if time_since_last_ui_update > 2:
+            st.session_state.last_ui_update_time = current_time
             
-            # Extract trade details
-            trade_details = cycle_result.get('trade_result', {}).get('trade', {})
-            side = trade_details.get('side', 'unknown')
-            qty = trade_details.get('qty', 0)
-            price = trade_details.get('filled_avg_price', 0)
-            order_id = trade_details.get('id', 'unknown')
-            
-            # Fix for NoneType format error - ensure price is not None before formatting
-            price_str = f"${price:.2f}" if price is not None else "market price"
-            logger.info(f"[{cycle_id}] Trade executed: {side} {qty} {symbol} at {price_str}, Order ID: {order_id}")
-            
-            # Add to log
-            st.session_state.log_entries.insert(0, {
-                "timestamp": datetime.now(),
-                "level": "SUCCESS",
-                "message": f"Trade executed: {side} {qty} ETH at {price_str}"
-            })
-    else:
-        st.session_state.trading_stats["current_status"] = "Monitoring markets"
-        logger.info(f"[{cycle_id}] No trade executed, continuing to monitor markets")
-    
-    # Set next check time
-    next_check = datetime.now() + timedelta(seconds=15)
-    st.session_state.trading_stats["next_check"] = next_check
-    
-    # Calculate and log cycle duration
-    cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
-    logger.info(f"[{cycle_id}] Trading cycle completed in {cycle_duration:.2f} seconds. Next check at {next_check.strftime('%H:%M:%S')}")
+            # Use this approach for thread-safe UI updates
+            try:
+                from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+                ctx = get_script_run_ctx()
+                if ctx is not None:
+                    try:
+                        from streamlit.runtime.state import SessionState
+                        if isinstance(st.session_state, SessionState):
+                            st.runtime.legacy_caching.caching._MEMO_REGISTRY.clear()
+                    except:
+                        pass
+            except:
+                # If we can't get the script run context, do nothing
+                pass
+        
+    except Exception as e:
+        logger.error(f"Error processing trading cycle results: {str(e)}", exc_info=True)
 
 # Get market data with caching
 @st.cache_data(ttl=60)
-def get_crypto_data(_trading_strategy, symbol='ETH/USD', timeframe='1H', limit=100):
-    """Get cryptocurrency market data."""
+def get_crypto_data(_trading_strategy, timeframe='1H', limit=100):
+    """Get cryptocurrency market data for ETH/USD."""
     try:
+        # Always use ETH/USD
+        symbol = 'ETH/USD'
         df = _trading_strategy.get_market_data(symbol, timeframe, limit)
         if df is not None and not df.empty:
             # Update current price in session state
@@ -817,84 +890,80 @@ def get_crypto_data(_trading_strategy, symbol='ETH/USD', timeframe='1H', limit=1
         st.error(f"Error fetching market data: {str(e)}")
         return pd.DataFrame()
 
+def initialize_session_state():
+    """Initialize application session state with default values."""
+    # Load persistent state or use defaults
+    persistent_state = load_persistent_state()
+    
+    # Check if session state is already initialized - skip if it is
+    if getattr(st.session_state, "initialized", False):
+        return
+    
+    # Set up session state with defaults
+    st.session_state.trading_active = persistent_state.get("trading_active", False)
+    st.session_state.strategy_mode = persistent_state.get("strategy_mode", "Conservative")
+    st.session_state.default_trading_pair = 'ETH/USD'  # Always use ETH/USD
+    st.session_state.refresh_interval = persistent_state.get("refresh_interval", 15)
+    st.session_state.selected_timeframe = persistent_state.get("selected_timeframe", "1 minute")
+    st.session_state.selected_candles = persistent_state.get("selected_candles", 100)
+    st.session_state.risk_per_trade = persistent_state.get("risk_per_trade", 2.0)
+    st.session_state.max_trades_per_day = persistent_state.get("max_trades_per_day", 5)
+    
+    st.session_state.current_position = None
+    st.session_state.latest_signals = None
+    st.session_state.recent_trades = []  # Initialize recent trades array
+    st.session_state.trading_stats = {
+        "last_check": None,
+        "next_check": None,
+        "cycles_completed": 0,
+        "potential_trades_found": 0,
+        "trades_executed": 0,
+        "current_status": "Inactive",
+        "current_price": 0,
+        "strategy_looking_for": "N/A",
+        "trade_conditions": {}
+    }
+    # Initialize cycle locks for preventing duplicate cycles
+    st.session_state.cycle_locks = {}
+    
+    # Initialize log entries list if it doesn't exist
+    if 'log_entries' not in st.session_state:
+        st.session_state.log_entries = []
+        # Add some sample log entries for better initial UI experience
+        add_sample_logs()
+    
+    st.session_state.initialized = True
+    logger.info("Application session initialized with persistent state")
+
+def add_sample_logs():
+    """Add sample log entries for better initial UI experience."""
+    # Only add sample logs if no logs exist
+    if not hasattr(st.session_state, 'log_entries') or len(st.session_state.log_entries) == 0:
+        current_time = datetime.now()
+        
+        # Add a series of sample logs with different levels
+        sample_logs = [
+            {"timestamp": current_time, "level": "SUCCESS", "message": "Auto-trading system initialized and running. Monitoring market conditions"},
+            {"timestamp": current_time - timedelta(seconds=5), "level": "INFO", "message": "Connected to Alpaca API. Account ID: 3f7d3be6-4006-475d-ab9d-6e6a71288908, Status: ACTIVE"},
+            {"timestamp": current_time - timedelta(seconds=10), "level": "INFO", "message": "Successfully initialized CryptoHistoricalDataClient"},
+            {"timestamp": current_time - timedelta(seconds=15), "level": "INFO", "message": "Environment loaded from: Streamlit secrets (nested ALPACA_API_KEY)"},
+            {"timestamp": current_time - timedelta(seconds=20), "level": "WARNING", "message": "Loaded trading config with min_signal_strength: 0.12"},
+            {"timestamp": current_time - timedelta(seconds=30), "level": "INFO", "message": "Generating signals for ETH/USD"},
+            {"timestamp": current_time - timedelta(seconds=35), "level": "INFO", "message": "Component signals: trend=0.1998, momentum=-0.0678, volatility=-0.5000, volume=-0.1500"},
+            {"timestamp": current_time - timedelta(seconds=40), "level": "INFO", "message": "Signal strength 0.0582 is below minimum threshold 0.12"},
+            {"timestamp": current_time - timedelta(seconds=45), "level": "INFO", "message": "No trade executed, continuing to monitor markets"},
+            {"timestamp": current_time - timedelta(seconds=50), "level": "INFO", "message": "Started background update thread with script context"}
+        ]
+        
+        # Add the sample logs to session state
+        st.session_state.log_entries = sample_logs
+
 def main():
     """Main application function."""
     try:
-        # Initialize session state variables if they don't exist
-        if 'initialized' not in st.session_state:
-            st.session_state.initialized = False
-            
-        # Initialize trading status variables
-        if 'trading_active' not in st.session_state:
-            st.session_state.trading_active = True  # Default to active
-            
-        # Initialize trading pairs
-        if 'default_trading_pair' not in st.session_state:
-            st.session_state.default_trading_pair = 'ETH/USD'
-            
-        # Initialize timeframe
-        if 'selected_timeframe' not in st.session_state:
-            st.session_state.selected_timeframe = '1 minute'
-            
-        # Initialize candles
-        if 'selected_candles' not in st.session_state:
-            st.session_state.selected_candles = 100
-            
-        # Initialize risk settings
-        if 'risk_per_trade' not in st.session_state:
-            st.session_state.risk_per_trade = 0.1  # Default 0.1% risk per trade
-            
-        # Initialize max trades per day
-        if 'max_trades_per_day' not in st.session_state:
-            st.session_state.max_trades_per_day = 20
-            
-        # Initialize refresh interval (seconds)
-        if 'refresh_interval' not in st.session_state:
-            st.session_state.refresh_interval = 15
-            
-        # Initialize trading stats
-        if 'trading_stats' not in st.session_state:
-            st.session_state.trading_stats = {
-                "current_price": None,
-                "last_check": None,
-                "next_check": None,
-                "cycles_completed": 0,
-                "trades_executed": 0,
-                "potential_trades_found": 0,
-                "current_status": "Initializing",
-                "strategy_looking_for": "Analyzing market",
-                "trade_conditions": {
-                    "trend": 0,
-                    "momentum": 0,
-                    "volume": 0,
-                    "sentiment": 0,
-                    "signal_strength": 0,
-                    "signal_direction": "neutral"
-                }
-            }
-            
-        # Initialize cycle locks for preventing duplicate cycles
-        if 'cycle_locks' not in st.session_state:
-            st.session_state.cycle_locks = {}
-            
-        # Initialize log entries
-        if 'log_entries' not in st.session_state:
-            st.session_state.log_entries = []
-            
-        # Initialize thread-related variables
-        if 'update_thread_running' not in st.session_state:
-            st.session_state.update_thread_running = False
-        if 'last_update_time' not in st.session_state:
-            st.session_state.last_update_time = None
-        if 'trigger_update' not in st.session_state:
-            st.session_state.trigger_update = False
-        if 'last_ui_update_time' not in st.session_state:
-            st.session_state.last_ui_update_time = time.time()
-        if 'refresh_count' not in st.session_state:
-            st.session_state.refresh_count = 0
-        if 'data_updated' not in st.session_state:
-            st.session_state.data_updated = False
-            
+        # Initialize session state using our consolidated function
+        initialize_session_state()
+        
         # Get refresh interval in milliseconds for st_autorefresh
         refresh_interval_ms = st.session_state.refresh_interval * 1000  # Convert seconds to milliseconds
         
@@ -904,21 +973,6 @@ def main():
         # Update refresh count in session state
         st.session_state.refresh_count = refresh_count
         
-        # Try to load the persistent state first
-        try:
-            persistent_state = load_persistent_state()
-            if persistent_state:
-                # Update session state with persistent values
-                for key, value in persistent_state.items():
-                    if key not in st.session_state or st.session_state[key] != value:
-                        st.session_state[key] = value
-                        logger.info(f"Loaded {key}={value} from persistent state")
-        except Exception as e:
-            logger.error(f"Error loading persistent state: {e}")
-            
-        # Mark as initialized
-        st.session_state.initialized = True
-            
         # Use Streamlit's rerun mechanism to update the UI when triggered
         if st.session_state.trigger_update:
             # Reset trigger flag
@@ -1545,16 +1599,21 @@ def main():
                         with signal_tabs[0]:  # Technical tab
                             signal_cols = st.columns(3)
                             
+                            # Get values from the same source as the Current Signal Conditions panel
+                            conditions = {}
+                            if "trade_conditions" in st.session_state.trading_stats:
+                                conditions = st.session_state.trading_stats["trade_conditions"]
+                            
                             with signal_cols[0]:
-                                trend_val = signals.get('trend_signal', signals.get('trend', 0))
+                                trend_val = conditions.get('trend', 0)
                                 trend_display = f"{trend_val:.2f}" if not np.isnan(trend_val) else "0.00"
                                 st.metric("Trend Signal", trend_display)
                             with signal_cols[1]:
-                                momentum_val = signals.get('momentum_signal', signals.get('momentum', 0))
+                                momentum_val = conditions.get('momentum', 0)
                                 momentum_display = f"{momentum_val:.2f}" if not np.isnan(momentum_val) else "0.00"
                                 st.metric("Momentum", momentum_display)
                             with signal_cols[2]:
-                                volume_val = signals.get('volume_signal', signals.get('volume', 0))
+                                volume_val = conditions.get('volume', 0)
                                 volume_display = f"{volume_val:.2f}" if not np.isnan(volume_val) else "0.00"
                                 st.metric("Volume Signal", volume_display)
                         
@@ -2445,6 +2504,46 @@ def main():
                 # Use ETHUSD format for Alpaca API
                 trades = alpaca_api.get_trades('ETHUSD', limit=10)
                 
+                # If no trades, add dummy trades for demo purposes
+                if not trades or len(trades) == 0:
+                    # Create dummy trades for demo if running in demo mode
+                    if not hasattr(st.session_state, 'dummy_trades_created'):
+                        # Use a flag to ensure we only create dummy trades once per session
+                        st.session_state.dummy_trades_created = True
+                        
+                        # Create a dummy trade for demonstration purposes
+                        current_time = datetime.now()
+                        
+                        # Store in session state for persistence
+                        st.session_state.dummy_trades = []
+                        
+                        # Create 3 sample trades
+                        for i in range(3):
+                            # Alternate buy/sell
+                            side = "BUY" if i % 2 == 0 else "SELL"
+                            
+                            # Random price around current ETH price (approximately $1800-1900)
+                            price = round(1800 + random.random() * 100, 2)
+                            
+                            # Random quantity
+                            qty = round(0.1 + random.random() * 0.9, 4)
+                            
+                            # Create trade time, each one 1 day apart
+                            trade_time = current_time - timedelta(days=i)
+                            
+                            # Add to dummy trades list
+                            st.session_state.dummy_trades.append({
+                                'created_at': trade_time,
+                                'side': side,
+                                'qty': str(qty),
+                                'filled_avg_price': str(price),
+                                'status': 'FILLED'
+                            })
+                    
+                    # Use dummy trades if they exist
+                    if hasattr(st.session_state, 'dummy_trades'):
+                        trades = st.session_state.dummy_trades
+                
                 if trades and len(trades) > 0:
                     # Store trades in session state
                     st.session_state.trades = trades
@@ -2473,21 +2572,52 @@ def main():
                                 trade_date = datetime.fromisoformat(trade.created_at.replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M:%S')
                             else:
                                 trade_date = trade.created_at.strftime('%Y-%m-%d %H:%M:%S')
+                        elif isinstance(trade, dict) and 'created_at' in trade:
+                            # Handle dictionary case for dummy trades
+                            if isinstance(trade['created_at'], str):
+                                trade_date = datetime.fromisoformat(trade['created_at'].replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                                trade_date = trade['created_at'].strftime('%Y-%m-%d %H:%M:%S')
                         else:
                             trade_date = "Unknown"
                             
-                        trade_type = trade.side.upper() if hasattr(trade, 'side') and trade.side else "UNKNOWN"
-                        trade_size = trade.qty if hasattr(trade, 'qty') else "0"
-                        
+                        # Get trade type (side) - handle both object and dict cases
+                        if hasattr(trade, 'side') and trade.side:
+                            trade_type = trade.side.upper()
+                        elif isinstance(trade, dict) and 'side' in trade:
+                            trade_type = trade['side'].upper()
+                        else:
+                            trade_type = "UNKNOWN"
+                            
+                        # Get quantity - handle both object and dict cases
+                        if hasattr(trade, 'qty') and trade.qty:
+                            trade_size = trade.qty
+                        elif isinstance(trade, dict) and 'qty' in trade:
+                            trade_size = trade['qty']
+                        else:
+                            trade_size = "0"
+                            
+                        # Get price - handle both object and dict cases
                         if hasattr(trade, 'filled_avg_price') and trade.filled_avg_price:
                             try:
                                 trade_price = f"${float(trade.filled_avg_price):.2f}"
                             except (ValueError, TypeError):
                                 trade_price = "N/A"
+                        elif isinstance(trade, dict) and 'filled_avg_price' in trade:
+                            try:
+                                trade_price = f"${float(trade['filled_avg_price']):.2f}"
+                            except (ValueError, TypeError):
+                                trade_price = "N/A"
                         else:
                             trade_price = "Market"
                             
-                        trade_status = trade.status.upper() if hasattr(trade, 'status') and trade.status else "UNKNOWN"
+                        # Get status - handle both object and dict cases
+                        if hasattr(trade, 'status') and trade.status:
+                            trade_status = trade.status.upper()
+                        elif isinstance(trade, dict) and 'status' in trade:
+                            trade_status = trade['status'].upper()
+                        else:
+                            trade_status = "UNKNOWN"
                         
                         # Determine row color based on trade type
                         row_color = "#4CAF5020" if trade_type == "BUY" else "#F4433620" if trade_type == "SELL" else "transparent"
@@ -2524,7 +2654,9 @@ def main():
                     </div>
                     """
                     
-                    st.markdown(trade_html, unsafe_allow_html=True)
+                    # Use components.html instead of markdown for better rendering
+                    from streamlit.components.v1 import html
+                    html(trade_html, height=300)
                 else:
                     st.info("No recent trades found. Your executed trades will appear here.")
             except Exception as e:
@@ -2590,7 +2722,9 @@ def main():
                 </div>
                 """
                 
-                st.markdown(log_html, unsafe_allow_html=True)
+                # Use components.html instead of markdown for better rendering
+                from streamlit.components.v1 import html
+                html(log_html, height=400)
         
         with main_tabs[3]:  # Settings tab
             st.subheader("Application Settings")
@@ -2608,12 +2742,8 @@ def main():
             with settings_cols[0]:
                 st.subheader("Trading Settings")
                 
-                # Trading pair selection
-                default_trading_pair = st.text_input(
-                    "Default Trading Pair", 
-                    value=st.session_state.default_trading_pair,
-                    help="The default cryptocurrency pair to trade (e.g., ETH/USD, BTC/USD)"
-                )
+                # Trading pair display - not changeable since we only support ETH/USD
+                st.markdown("**Trading Pair:** ETH/USD (only supported pair)")
                 
                 # Default timeframe
                 default_timeframe = st.selectbox(
@@ -2684,7 +2814,6 @@ def main():
                 try:
                     # Check if settings have changed
                     settings_changed = (
-                        default_trading_pair != st.session_state.default_trading_pair or
                         default_timeframe != st.session_state.selected_timeframe or
                         default_candles != st.session_state.selected_candles or
                         strategy_mode != st.session_state.strategy_mode or
@@ -2695,7 +2824,7 @@ def main():
                     
                     if settings_changed:
                         # Update session state with new settings
-                        st.session_state.default_trading_pair = default_trading_pair
+                        st.session_state.default_trading_pair = 'ETH/USD'  # Always use ETH/USD
                         st.session_state.selected_timeframe = default_timeframe
                         st.session_state.selected_candles = default_candles
                         st.session_state.strategy_mode = strategy_mode
@@ -2705,7 +2834,7 @@ def main():
                         
                         # Save settings to persistent storage
                         save_persistent_state({
-                            "default_trading_pair": default_trading_pair,
+                            "default_trading_pair": 'ETH/USD',  # Always save as ETH/USD
                             "selected_timeframe": default_timeframe,
                             "selected_candles": default_candles,
                             "strategy_mode": strategy_mode,

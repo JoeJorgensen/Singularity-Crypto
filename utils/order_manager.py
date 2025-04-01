@@ -52,56 +52,53 @@ class OrderManager:
     
     def get_positions(self) -> List[Dict]:
         """
-        Get current positions.
+        Get current ETH/USD position.
         
         Returns:
-            List of position dictionaries
+            List containing ETH/USD position dictionary if it exists
         """
         try:
-            # Get list of supported pairs from config
-            supported_pairs = self.config.get('trading', {}).get('supported_pairs', ['ETH/USD'])
-            
+            # Only check ETH/USD
+            symbol = 'ETH/USD'
             positions = []
-            # Try to get position for each supported pair
-            for symbol in supported_pairs:
-                try:
-                    position = self.alpaca.get_position(symbol)
-                    if position:
-                        # Convert position object to dictionary
-                        position_dict = {
-                            'symbol': position.symbol,
-                            'qty': position.qty,
-                            'market_value': position.market_value,
-                            'avg_entry_price': position.avg_entry_price,
-                            'current_price': position.current_price,
-                            'unrealized_pl': position.unrealized_pl,
-                            'unrealized_plpc': position.unrealized_plpc
-                        }
+            
+            try:
+                position = self.alpaca.get_position(symbol)
+                if position:
+                    # Convert position object to dictionary
+                    position_dict = {
+                        'symbol': position.symbol,
+                        'qty': position.qty,
+                        'market_value': position.market_value,
+                        'avg_entry_price': position.avg_entry_price,
+                        'current_price': position.current_price,
+                        'unrealized_pl': position.unrealized_pl,
+                        'unrealized_plpc': position.unrealized_plpc
+                    }
+                    
+                    # Calculate what percentage of portfolio this position represents
+                    try:
+                        account = self.alpaca.get_account()
+                        portfolio_value = float(account.portfolio_value)
+                        position_value = float(position.market_value)
+                        position_dict['portfolio_percentage'] = (position_value / portfolio_value * 100) if portfolio_value > 0 else 0
+                    except:
+                        position_dict['portfolio_percentage'] = 0
                         
-                        # Calculate what percentage of portfolio this position represents
-                        try:
-                            account = self.alpaca.get_account()
-                            portfolio_value = float(account.portfolio_value)
-                            position_value = float(position.market_value)
-                            position_dict['portfolio_percentage'] = (position_value / portfolio_value * 100) if portfolio_value > 0 else 0
-                        except:
-                            position_dict['portfolio_percentage'] = 0
-                            
-                        positions.append(position_dict)
-                except Exception as position_error:
-                    error_message = str(position_error).lower()
-                    # Only log at debug level for 'position does not exist' errors
-                    if 'position does not exist' in error_message:
-                        logger.debug(f"No position exists for {symbol} - this is normal")
-                    else:
-                        # Log real errors at warning level
-                        logger.warning(f"Error retrieving position for {symbol}: {error_message}")
+                    positions.append(position_dict)
+            except Exception as position_error:
+                error_message = str(position_error).lower()
+                # Only log at debug level for 'position does not exist' errors
+                if 'position does not exist' in error_message:
+                    logger.debug("No position exists for ETH/USD - this is normal")
+                else:
+                    # Log real errors at warning level
+                    logger.warning(f"Error retrieving position for ETH/USD: {error_message}")
             
             if positions:
-                position_count = len(positions)
-                logger.debug(f"Retrieved {position_count} active positions")
+                logger.debug("Retrieved ETH/USD position")
             else:
-                logger.debug("No active positions found")
+                logger.debug("No active ETH/USD position found")
             return positions
         except Exception as e:
             error_message = str(e).lower()
@@ -155,35 +152,34 @@ class OrderManager:
         stop_price: Optional[float] = None
     ) -> Dict:
         """
-        Execute a trade with the specified parameters.
+        Execute a trade with the given parameters.
         
         Args:
-            symbol: Symbol to trade
+            symbol: Trading pair symbol (e.g. ETH/USD)
             qty: Quantity to trade
-            side: 'buy' or 'sell'
-            order_type: 'market', 'limit', or 'stop_limit'
+            side: Trade side ('buy' or 'sell')
+            order_type: Order type ('market', 'limit', 'stop_limit')
             limit_price: Limit price for limit orders
-            stop_price: Stop price for stop orders
+            stop_price: Stop price for stop limit orders
             
         Returns:
-            Order information dictionary
+            Dictionary with order information
         """
-        # Validate quantity before proceeding
-        if qty <= 0:
-            logger.error(f"Invalid quantity: {qty}. Must be greater than 0.")
-            return {
-                "error": f"Invalid quantity: {qty}. Must be greater than 0.",
-                "status": "rejected"
-            }
-            
-        # Keep the original symbol format for API calls
+        # Store original symbol before any modification
         original_symbol = symbol
-            
-        # Get current account info to double-check balances
+        
+        # Log the intended trade
+        logger.info(f"Executing {order_type} {side} order for {qty} {original_symbol}")
+        
+        # Get current account info to double-check balances with forced refresh
         try:
-            account = self.alpaca.get_account()
+            account = self.alpaca.get_account(force_refresh=True)
             buying_power = float(account.buying_power)
             portfolio_value = float(account.portfolio_value)
+            cash = float(account.cash)
+            
+            # Log detailed account information for debugging
+            logger.info(f"Account status before trade - Cash: ${cash:.2f}, Buying Power: ${buying_power:.2f}, Portfolio Value: ${portfolio_value:.2f}")
             
             # For buy orders, verify buying power again before submitting
             if side.lower() == 'buy':
@@ -332,92 +328,91 @@ class OrderManager:
                     
                     # Check if this is an insufficient balance error
                     if "insufficient" in error_msg and attempt < max_retries - 1:
-                        # Decrease quantity more aggressively for each retry
-                        # First retry 75%, second retry 50% of original
-                        reduction_factor = 0.75 * (0.67 ** attempt)
-                        current_qty = qty * reduction_factor
+                        # Try to extract available balance from the error message
+                        import re
+                        available_match = re.search(r'available: \$([\d.]+)', error_msg)
+                        requested_match = re.search(r'requested: \$([\d.]+)', error_msg)
                         
-                        # Make sure we're not trying a tiny order
-                        if current_qty < 0.001:
-                            logger.error(f"Cannot reduce quantity further. Order aborted.")
-                            return {
-                                "error": f"Insufficient balance for minimum order size.",
-                                "status": "rejected"
-                            }
+                        if available_match and requested_match:
+                            available = float(available_match.group(1))
+                            requested = float(requested_match.group(1))
                             
-                        logger.warning(f"Insufficient balance error. Retrying with reduced quantity: {current_qty:.6f} {original_symbol} (attempt {attempt+1}/{max_retries})")
-                        continue
-                    else:
-                        # Extract helpful information from the error if possible
-                        if "insufficient balance" in error_msg:
-                            # Try to extract available balance from the error message
-                            import re
-                            available_match = re.search(r'available: ([\d.]+)', error_msg)
-                            requested_match = re.search(r'requested: ([\d.]+)', error_msg)
-                            
-                            if available_match and requested_match:
-                                available = float(available_match.group(1))
-                                requested = float(requested_match.group(1))
+                            # Only retry if there's some actual available balance
+                            if available > 5.0:  # Minimum order value of $5
+                                # Calculate a conservative percentage of the available balance
+                                new_size_ratio = (available * 0.95) / requested
+                                current_qty = qty * new_size_ratio
                                 
-                                # Check if price is defined and valid before attempting to use it
-                                if 'price' in locals() and price is not None and attempt < max_retries - 1:
-                                    safe_qty = (available * 0.95) / price  # Use 95% of available
-                                    if safe_qty > 0.001 and safe_qty * price >= 5:
-                                        current_qty = safe_qty
-                                        logger.warning(f"Attempting one more time with quantity based on exact available balance: {current_qty:.6f}")
-                                        continue
-                                
+                                logger.warning(f"Insufficient balance error. Retrying with calculated quantity: {current_qty:.6f} {original_symbol} (attempt {attempt+1}/{max_retries})")
+                                continue
+                            else:
+                                # If available balance is too low, provide clear error
                                 logger.error(f"Order failed: requested ${requested:.2f} but only ${available:.2f} available")
                                 return {
                                     "error": f"Insufficient balance: ${available:.2f} available, ${requested:.2f} required.",
                                     "status": "rejected"
                                 }
-                        
-                        # Log and return error for other errors or if we've exhausted retries
-                        logger.error(f"Order execution failed for {side} {current_qty} {original_symbol}: {str(e)}", exc_info=True)
-                        
-                        # Special handling for price determination errors
-                        if "could not determine current price" in error_msg.lower():
-                            # If this is a market order, try again with a direct market order, bypassing buying power check
-                            if order_type.lower() == 'market' and attempt < max_retries - 1:
-                                logger.warning("Price data unavailable. Retrying market order with direct API approach...")
-                                try:
-                                    # Try to execute a direct market order without the buying power check
-                                    trading_symbol = original_symbol.replace('/', '')
-                                    
-                                    # Use direct API call to Alpaca
-                                    base_url = "https://paper-api.alpaca.markets/v2/orders"
-                                    headers = {
-                                        "APCA-API-KEY-ID": self.alpaca.api_key,
-                                        "APCA-API-SECRET-KEY": self.alpaca.api_secret,
-                                        "Content-Type": "application/json"
-                                    }
-                                    
-                                    # Build basic market order
-                                    order_data = {
-                                        "symbol": trading_symbol,
-                                        "qty": str(current_qty),
-                                        "side": side.lower(),
-                                        "type": "market",
-                                        "time_in_force": "gtc"
-                                    }
-                                    
-                                    import requests
-                                    response = requests.post(base_url, headers=headers, json=order_data)
-                                    
-                                    if response.status_code == 200:
-                                        order_dict = response.json()
-                                        logger.info(f"Direct market order successful: {order_dict.get('id')}")
-                                        return order_dict
-                                    else:
-                                        logger.error(f"Direct market order failed: {response.text}")
-                                except Exception as direct_error:
-                                    logger.error(f"Direct market order failed: {str(direct_error)}")
-                        
-                        return {
-                            "error": str(e),
-                            "status": "rejected" 
-                        }
+                        else:
+                            # If we can't extract the exact values, use a more aggressive reduction
+                            reduction_factor = 0.65 * (0.5 ** attempt)
+                            current_qty = qty * reduction_factor
+                            
+                            # Make sure we're not trying a tiny order
+                            if current_qty < 0.001:
+                                logger.error(f"Cannot reduce quantity further. Order aborted.")
+                                return {
+                                    "error": f"Insufficient balance for minimum order size.",
+                                    "status": "rejected"
+                                }
+                                
+                            logger.warning(f"Insufficient balance error. Retrying with reduced quantity: {current_qty:.6f} {original_symbol} (attempt {attempt+1}/{max_retries})")
+                            continue
+                    
+                    # Log and return error for other errors or if we've exhausted retries
+                    logger.error(f"Order execution failed for {side} {current_qty} {original_symbol}: {str(e)}", exc_info=True)
+                    
+                    # Special handling for price determination errors
+                    if "could not determine current price" in error_msg.lower():
+                        # If this is a market order, try again with a direct market order, bypassing buying power check
+                        if order_type.lower() == 'market' and attempt < max_retries - 1:
+                            logger.warning("Price data unavailable. Retrying market order with direct API approach...")
+                            try:
+                                # Try to execute a direct market order without the buying power check
+                                trading_symbol = original_symbol.replace('/', '')
+                                
+                                # Use direct API call to Alpaca
+                                base_url = "https://paper-api.alpaca.markets/v2/orders"
+                                headers = {
+                                    "APCA-API-KEY-ID": self.alpaca.api_key,
+                                    "APCA-API-SECRET-KEY": self.alpaca.api_secret,
+                                    "Content-Type": "application/json"
+                                }
+                                
+                                # Build basic market order
+                                order_data = {
+                                    "symbol": trading_symbol,
+                                    "qty": str(current_qty),
+                                    "side": side.lower(),
+                                    "type": "market",
+                                    "time_in_force": "gtc"
+                                }
+                                
+                                import requests
+                                response = requests.post(base_url, headers=headers, json=order_data)
+                                
+                                if response.status_code == 200:
+                                    order_dict = response.json()
+                                    logger.info(f"Direct market order successful: {order_dict.get('id')}")
+                                    return order_dict
+                                else:
+                                    logger.error(f"Direct market order failed: {response.text}")
+                            except Exception as direct_error:
+                                logger.error(f"Direct market order failed: {str(direct_error)}")
+                    
+                    return {
+                        "error": str(e),
+                        "status": "rejected" 
+                    }
         except Exception as e:
             logger.warning(f"Could not verify account balance before order: {str(e)}")
             return {

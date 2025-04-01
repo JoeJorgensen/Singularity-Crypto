@@ -18,6 +18,7 @@ from functools import lru_cache
 import websockets
 from alpaca.data.timeframe import TimeFrameUnit
 import numpy as np
+import random
 
 
 # Alpaca-py imports
@@ -188,14 +189,32 @@ class AlpacaAPI:
         self.price_cache_updater_thread = None
         self.price_update_interval = 15  # seconds
         
+        # Rate limiting settings to prevent hitting API limits
+        self.api_calls = 0
+        self.api_call_reset_time = time.time() + 60
+        self.max_calls_per_minute = 175  # Alpaca limit is 200/min, use 175 for safety
+        self.rate_limit_lock = threading.Lock()
+        
+        # Track recent API calls for advanced rate limiting
+        self.recent_api_calls = []
+        self.max_burst_calls = 50  # Maximum calls to allow in a 10-second window
+        
     # Use LRU cache for account info (refreshes every minute)
     @lru_cache(maxsize=1)
     def _get_account_cached(self, timestamp):
         """Get account information with caching."""
         return self.trading_client.get_account()
     
-    def get_account(self):
-        """Get account information with time-based cache busting."""
+    def get_account(self, force_refresh=False):
+        """Get account information with time-based cache busting.
+        
+        Args:
+            force_refresh: If True, bypass cache and get fresh data
+        """
+        if force_refresh:
+            self._get_account_cached.cache_clear()
+            self.logger.info("Account cache cleared for fresh data")
+            
         # Round to nearest minute to provide cache stability
         cache_timestamp = int(time.time() / self.cache_ttl) * self.cache_ttl
         return self._get_account_cached(cache_timestamp)
@@ -392,19 +411,19 @@ class AlpacaAPI:
     
     def get_crypto_bars(self, symbol: str, timeframe: str = '1Min', limit: int = 100) -> pd.DataFrame:
         """
-        Get cryptocurrency bars from Alpaca.
+        Get cryptocurrency bars from Alpaca for ETH/USD only.
         
         Args:
-            symbol: The cryptocurrency symbol
+            symbol: The cryptocurrency symbol (only ETH/USD supported)
             timeframe: The timeframe for the bars
             limit: Number of bars to return
             
         Returns:
             DataFrame with the bars
         """
-        # Skip known unsupported symbols to avoid unnecessary API calls and errors
-        if symbol in ['LTC/USD', 'BCH/USD', 'XRP/USD']:
-            self.logger.debug(f"Skipping known unsupported symbol: {symbol}")
+        # Only support ETH/USD - skip other symbols
+        if symbol != 'ETH/USD':
+            self.logger.debug(f"Only ETH/USD is supported, but {symbol} was requested")
             return pd.DataFrame()
             
         try:
@@ -1047,8 +1066,12 @@ class AlpacaAPI:
             
             # Double-check buying power for buy orders to prevent frequent errors
             if side.lower() == 'buy' and type.lower() in ['market', 'limit']:
-                account = self.get_account()
+                # Get fresh account data (bypass cache)
+                account = self.get_account(force_refresh=True)
                 buying_power = float(account.buying_power)
+                
+                # Log clear account information for debugging
+                self.logger.info(f"Account status: Cash: ${float(account.cash):.2f}, Buying Power: ${buying_power:.2f}")
                 
                 # Estimate order value
                 if type.lower() == 'limit':
@@ -1129,6 +1152,10 @@ class AlpacaAPI:
             order_type = type.lower()
             if order_type not in ['market', 'limit', 'stop_limit']:
                 raise ValueError(f"Unsupported order type for crypto: {order_type}. Must be one of: market, limit, stop_limit")
+            
+            # Check rate limit before submitting order
+            if not self.check_rate_limit():
+                raise Exception("Rate limit protection activated. Order submission aborted to prevent API ban.")
             
             # Build the appropriate order based on type
             if order_type == 'market':
@@ -1218,6 +1245,36 @@ class AlpacaAPI:
                 # Extract error details for better error handling
                 error_data = str(e)
                 
+                # Special handling for rate limit errors
+                if "rate limit exceeded" in error_data.lower() or "429" in error_data:
+                    retry_attempts = 3
+                    base_delay = 1.0
+                    
+                    # Attempt to retry with exponential backoff
+                    for retry in range(retry_attempts):
+                        # Calculate backoff delay with jitter
+                        delay = base_delay * (2 ** retry) + random.uniform(0, 0.5)
+                        self.logger.warning(f"Rate limit exceeded. Retrying in {delay:.2f}s (attempt {retry+1}/{retry_attempts})")
+                        
+                        # Sleep before retry
+                        time.sleep(delay)
+                        
+                        try:
+                            # Retry the order submission
+                            order = self.trading_client.submit_order(order_data)
+                            self.logger.info(f"Order retry successful after rate limit error")
+                            return order
+                        except alpaca.common.exceptions.APIError as retry_error:
+                            # If this is still a rate limit error, continue the retry loop
+                            if "rate limit exceeded" in str(retry_error).lower() or "429" in str(retry_error):
+                                continue
+                            else:
+                                # If it's a different error, raise it
+                                raise retry_error
+                    
+                    # If we've exhausted retries, raise the original error
+                    raise Exception(f"Order failed after multiple retries: {error_data}")
+                
                 # Special handling for insufficient balance errors
                 if "insufficient balance" in error_data.lower():
                     # Get available balance from the error message if possible
@@ -1299,6 +1356,10 @@ class AlpacaAPI:
         try:
             # Convert symbol format for Trading API (remove slash)
             trading_symbol = symbol.replace('/', '')  
+            
+            # Check rate limit before proceeding
+            if not self.check_rate_limit():
+                raise Exception("Rate limit protection activated. Position close aborted to prevent API ban.")
             
             # Direct API approach - more reliable in edge cases
             # Step 1: Cancel all orders for this symbol using direct API
@@ -1831,3 +1892,50 @@ class AlpacaAPI:
         if df is not None and not df.empty:
             return df.replace([np.inf, -np.inf], np.nan)
         return df
+
+    def check_rate_limit(self):
+        """
+        Check if we're at our rate limit and wait if necessary.
+        Returns False if we should abort due to excessive rate limiting.
+        """
+        with self.rate_limit_lock:
+            current_time = time.time()
+            
+            # Clean up old API call timestamps
+            self.recent_api_calls = [t for t in self.recent_api_calls if current_time - t < 10]
+            
+            # Check if we're exceeding our burst limit (too many calls in 10 seconds)
+            if len(self.recent_api_calls) >= self.max_burst_calls:
+                # We're making too many calls too quickly, need to back off
+                oldest_call = min(self.recent_api_calls)
+                wait_time = 10 - (current_time - oldest_call) + 1  # Add 1 second buffer
+                self.logger.warning(f"Rate limit burst protection: waiting {wait_time:.2f}s to avoid exceeding limits")
+                time.sleep(wait_time)
+                
+                # After waiting, clean up the list again
+                current_time = time.time()
+                self.recent_api_calls = [t for t in self.recent_api_calls if current_time - t < 10]
+            
+            # Reset counter if we've passed the reset time
+            if current_time > self.api_call_reset_time:
+                self.api_calls = 0
+                self.api_call_reset_time = current_time + 60
+            
+            # Check if we're at the rate limit
+            if self.api_calls >= self.max_calls_per_minute:
+                # Calculate wait time until reset
+                wait_time = self.api_call_reset_time - current_time
+                
+                if wait_time > 0:
+                    self.logger.warning(f"Rate limit reached ({self.api_calls} calls in this minute). Waiting {wait_time:.2f}s for limit reset.")
+                    time.sleep(wait_time)
+                    
+                    # Reset after waiting
+                    self.api_calls = 0
+                    self.api_call_reset_time = time.time() + 60
+            
+            # Track this API call
+            self.api_calls += 1
+            self.recent_api_calls.append(time.time())
+            
+            return True

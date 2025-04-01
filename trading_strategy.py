@@ -129,16 +129,13 @@ class TradingStrategy:
                 
                 # Start websocket connection for real-time data
                 # We start this in a thread to avoid blocking initialization
-                # List of symbols to monitor
-                symbols_to_monitor = self.config.get('trading', {}).get(
-                    'supported_pairs', 
-                    ['ETH/USD']
-                )
+                # Only monitor ETH/USD
+                symbols_to_monitor = ['ETH/USD']
                 
                 # Define background function for starting websocket
                 def start_ws_in_background():
                     try:
-                        self.logger.info(f"Starting websocket connection for {symbols_to_monitor} in background")
+                        self.logger.info("Starting websocket connection for ETH/USD in background")
                         # Start with a short timeout for initial connection
                         result = alpaca_api.start_websocket(
                             symbols=symbols_to_monitor,
@@ -147,22 +144,22 @@ class TradingStrategy:
                         )
                         
                         if result:
-                            self.logger.info(f"Websocket connection started successfully for {symbols_to_monitor}")
+                            self.logger.info("Websocket connection started successfully for ETH/USD")
                         else:
-                            self.logger.warning(f"Websocket connection failed to start for {symbols_to_monitor}, using REST API polling as fallback")
+                            self.logger.warning("Websocket connection failed to start for ETH/USD, using REST API polling as fallback")
                     except Exception as e:
                         self.logger.error(f"Error starting websocket: {str(e)}")
                         self.logger.info("Continuing with REST API polling as fallback")
                 
                 # Start websocket thread - only done once per application instance
-                self.logger.info(f"Starting websocket connection for {symbols_to_monitor} in background")
+                self.logger.info("Starting websocket connection for ETH/USD in background")
                 ws_thread = threading.Thread(target=start_ws_in_background, daemon=True)
                 ws_thread.start()
                 self.logger.info("Websocket initialization triggered in background thread")
                 
                 # Start the price cache updater to maintain price data even during API disruptions
                 try:
-                    self.logger.info(f"Starting price cache updater for {symbols_to_monitor}")
+                    self.logger.info("Starting price cache updater for ETH/USD")
                     alpaca_api.start_price_cache_updater(symbols=symbols_to_monitor)
                     self.logger.info("Price cache updater started successfully")
                 except Exception as e:
@@ -498,15 +495,15 @@ class TradingStrategy:
             # Determine signal direction and initial strength
             if composite_signal > 0:
                 signal_direction = "buy"
-                trade_direction = "long"
-                signal_strength = min(composite_signal, 1.0)  # Cap at 1.0
+                trade_direction = "bullish"  # Consistent terminology
+                signal_strength = min(abs(composite_signal), 1.0)  # Cap at 1.0
             elif composite_signal < 0:
                 signal_direction = "sell"
-                trade_direction = "short"
+                trade_direction = "bearish"  # Consistent terminology
                 signal_strength = min(abs(composite_signal), 1.0)  # Cap at 1.0
             else:
                 signal_direction = "neutral"
-                trade_direction = "none"
+                trade_direction = "neutral"  # Consistent terminology
                 signal_strength = 0.0
                 
             logger.info(f"Generated {signal_direction} signal with strength {signal_strength:.4f} and direction {trade_direction}")
@@ -529,27 +526,30 @@ class TradingStrategy:
                 # Recalculate direction and strength
                 if adjusted_signal > 0:
                     signal_direction = "buy"
-                    trade_direction = "long"
-                    signal_strength = min(adjusted_signal, 1.0)
+                    trade_direction = "bullish"
+                    signal_strength = min(abs(adjusted_signal), 1.0)
                 elif adjusted_signal < 0:
                     signal_direction = "sell"
-                    trade_direction = "short"
+                    trade_direction = "bearish"
                     signal_strength = min(abs(adjusted_signal), 1.0)
                 else:
                     signal_direction = "neutral"
-                    trade_direction = "none"
+                    trade_direction = "neutral"
                     signal_strength = 0.0
             
-            # Final signal values
-            final_signal = signal_strength if signal_direction == "buy" else -signal_strength if signal_direction == "sell" else 0
+            # Final signal value with sign
+            final_signal = adjusted_signal if sentiment_data else composite_signal
+            
+            # Ensure signal strength is always positive (magnitude)
+            signal_strength = min(abs(final_signal), 1.0)
             
             logger.info(f"Signal generated: {signal_direction} with strength {signal_strength:.4f}")
             
             # Create signals dictionary
             signals = {
-                "signal": composite_signal,
+                "signal": final_signal,  # Keep sign for raw signal value
                 "signal_direction": signal_direction,
-                "signal_strength": signal_strength,
+                "signal_strength": signal_strength,  # Always positive (magnitude)
                 "timestamp": datetime.now().isoformat(),
                 "symbol": self.default_pair,
                 "components": {
@@ -574,7 +574,7 @@ class TradingStrategy:
                 signals["price_change_pct"] = data['close'].pct_change().iloc[-1] * 100
                 
                 # Add entry point if signal is strong enough
-                if abs(final_signal) >= self.config.get('trading', {}).get('min_signal_strength', 0.2):
+                if signal_strength >= self.config.get('trading', {}).get('min_signal_strength', 0.2):
                     signals["entry_point"] = latest_price
             except:
                 pass
@@ -606,11 +606,14 @@ class TradingStrategy:
         
         # Debug output to verify the threshold
         logger.warning(f"DEBUG: Using min_signal_strength={min_signal_strength} (config value)")
+        logger.warning(f"DEBUG: Current signal strength={signal_strength}, abs value={abs(signal_strength)}")
         
-        # Check minimum strength requirement
-        if signal_strength < min_signal_strength:
+        # Check minimum strength requirement - ensure we use absolute value
+        if abs(signal_strength) < min_signal_strength:
             logger.info(f"Signal strength {signal_strength:.4f} is below minimum threshold {min_signal_strength}")
             return False
+        else:
+            logger.info(f"Signal strength {signal_strength:.4f} exceeds minimum threshold {min_signal_strength}")
         
         # Check for neutral signal
         if signal_direction == 'neutral':
@@ -783,18 +786,10 @@ class TradingStrategy:
             # Use available buying power for orders and respect position sizing limits
             # For buy (long) orders
             if side == 'buy':
-                # Ensure we use no more than available buying power
-                position_sizing_balance = available_balance
-                # Add more conservative safety buffer (10% below available)
-                safe_buy_amount = position_sizing_balance * 0.9
-                
-                # For extremely low buying power, use an even more conservative approach
-                if position_sizing_balance < 100:
-                    # Use only 70% of available buying power for very small amounts
-                    safe_buy_amount = position_sizing_balance * 0.7
-                    logger.info(f"Very low buying power (${position_sizing_balance:.2f}). Using conservative position sizing (70%)")
-                
-                logger.info(f"Using buy amount of ${safe_buy_amount:.2f} (from buying power ${position_sizing_balance:.2f})")
+                # Use a fixed percentage of available buying power (95%)
+                # This is simpler than risk-based position sizing and avoids the conflict
+                safe_buy_amount = available_balance * 0.95
+                logger.info(f"Using 95% of buying power: ${safe_buy_amount:.2f} (from ${available_balance:.2f})")
             else:
                 # For sell (short) orders
                 if has_existing_position and position_is_long:
@@ -806,18 +801,9 @@ class TradingStrategy:
                     # This is opening a new short position
                     logger.info(f"Opening new short position for {symbol} with direction: {trade_direction}")
                     
-                    # Use position sizing similar to buy orders but for shorts
-                    position_sizing_balance = available_balance
-                    # Add more conservative safety buffer (10% below available)
-                    safe_buy_amount = position_sizing_balance * 0.9
-                    
-                    # For extremely low buying power, use an even more conservative approach
-                    if position_sizing_balance < 100:
-                        # Use only 70% of available buying power for very small amounts
-                        safe_buy_amount = position_sizing_balance * 0.7
-                        logger.info(f"Very low buying power (${position_sizing_balance:.2f}). Using conservative position sizing (70%) for short")
-                    
-                    logger.info(f"Using short position amount of ${safe_buy_amount:.2f} (from buying power ${position_sizing_balance:.2f})")
+                    # Use 95% of available buying power for shorts too
+                    safe_buy_amount = available_balance * 0.95
+                    logger.info(f"Using 95% of buying power for short: ${safe_buy_amount:.2f} (from ${available_balance:.2f})")
             
             # Check if user settings are available (look for a state file)
             strategy_mode = "Moderate"  # Default value
@@ -863,15 +849,26 @@ class TradingStrategy:
                     "error": "Could not determine current price"
                 }
             
+            # Make sure we're using fresh account data
+            try:
+                account = self.apis['alpaca'].get_account(force_refresh=True)
+                available_balance = float(account.buying_power)
+                portfolio_value = float(account.portfolio_value)
+                
+                # Log updated account information
+                logger.info(f"Using fresh account data - Buying Power: ${available_balance:.2f}, Portfolio Value: ${portfolio_value:.2f}")
+            except Exception as e:
+                logger.warning(f"Could not refresh account data: {str(e)}")
+            
             # Calculate position size in quantity
             if side == 'buy':
                 # Long position
-                # Add a safety margin to account for potential price fluctuations
-                adjusted_price = price * 1.005  # Add 0.5% buffer for potential price fluctuations
+                # Add a small safety margin for price fluctuations
+                adjusted_price = price * 1.005  # Add 0.5% buffer
                 position_size = safe_buy_amount / adjusted_price
                 
                 # Make sure the position size is not too small
-                if position_size * price < 10 and position_size * price < safe_buy_amount * 0.9:
+                if position_size * price < 10:
                     logger.warning(f"Position value (${position_size * price:.2f}) is below minimum. Skipping trade.")
                     return {
                         "executed": False,
@@ -880,15 +877,15 @@ class TradingStrategy:
             else:
                 # Short position or close long
                 if has_existing_position and position_is_long:
-                    # Closing an existing long position
+                    # Closing an existing long position - use exact position size
                     position_size = existing_position_size
                 else:
                     # Opening a new short position
-                    adjusted_price = price * 0.995  # Subtract 0.5% buffer for potential price fluctuations
+                    adjusted_price = price * 0.995  # Subtract 0.5% buffer
                     position_size = safe_buy_amount / adjusted_price
                     
                     # Make sure the position size is not too small
-                    if position_size * price < 10 and position_size * price < safe_buy_amount * 0.9:
+                    if position_size * price < 10:
                         logger.warning(f"Short position value (${position_size * price:.2f}) is below minimum. Skipping trade.")
                         return {
                             "executed": False,
@@ -931,10 +928,12 @@ class TradingStrategy:
                         
                         # Check if it's an insufficient buying power error
                         if 'insufficient' in error_msg.lower() and retry_count < max_retries - 1:
-                            # Reduce position size by 15% and try again
+                            # Reduce position size by 25% on each retry
                             retry_count += 1
-                            current_position_size *= 0.85
-                            logger.warning(f"Retrying with reduced position size: {current_position_size:.6f} (attempt {retry_count}/{max_retries})")
+                            current_position_size *= 0.75
+                            
+                            # Log with more details about the retry
+                            logger.warning(f"Insufficient balance error. Retrying with reduced position size: {current_position_size:.6f} (value: ${current_position_size * price:.2f}) (attempt {retry_count}/{max_retries})")
                             continue
                         else:
                             # Non-retryable error or out of retries
@@ -957,8 +956,11 @@ class TradingStrategy:
                     # Check if it might be a sizing issue we can retry
                     if 'insufficient' in error_message.lower() and retry_count < max_retries - 1:
                         retry_count += 1
-                        current_position_size *= 0.85
-                        logger.warning(f"Error suggests sizing issue. Retrying with reduced size: {current_position_size:.6f} (attempt {retry_count}/{max_retries})")
+                        
+                        # More aggressive reduction for exception errors
+                        current_position_size *= 0.70
+                        
+                        logger.warning(f"Error suggests insufficient balance. Retrying with reduced size: {current_position_size:.6f} (value: ${current_position_size * price:.2f}) (attempt {retry_count}/{max_retries})")
                         continue
                     else:
                         # Non-retryable error or out of retries
@@ -1787,7 +1789,7 @@ class TradingStrategy:
             return 0
     
     def _initialize_websocket(self):
-        """Initialize the websocket connection for real-time market data"""
+        """Initialize the websocket connection for real-time ETH/USD market data"""
         try:
             # Check if websocket has already been initialized
             if hasattr(self, 'ws_initialization_attempted') and self.ws_initialization_attempted:
@@ -1797,28 +1799,21 @@ class TradingStrategy:
             # Mark as attempted
             self.ws_initialization_attempted = True
             
-            self.logger.info(f"Initializing websocket for {self.default_pair}")
+            self.logger.info("Initializing websocket for ETH/USD")
             
-            # Get all crypto pairs we might trade
-            supported_pairs = self.config.get('trading', {}).get(
-                'supported_pairs', 
-                ['ETH/USD']
-            )
-            
-            # Make sure default pair is included
-            if self.default_pair not in supported_pairs:
-                supported_pairs.append(self.default_pair)
+            # Only use ETH/USD
+            symbol = 'ETH/USD'
             
             websocket_started = self.apis['alpaca'].start_websocket(
-                symbols=supported_pairs, 
+                symbols=[symbol], 
                 timeout=5.0,
                 non_blocking=True
             )
             
             if websocket_started:
-                self.logger.info(f"Websocket initialized successfully for {supported_pairs}")
+                self.logger.info("Websocket initialized successfully for ETH/USD")
             else:
-                self.logger.warning(f"Failed to initialize websocket for {supported_pairs}. Will use REST API.")
+                self.logger.warning("Failed to initialize websocket for ETH/USD. Will use REST API.")
         except Exception as e:
             self.logger.error(f"Error initializing websocket: {e}")
             self.logger.warning("Will use REST API for market data.")
