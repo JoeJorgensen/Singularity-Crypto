@@ -47,6 +47,7 @@ def verify_secrets():
     """Check if we have access to Streamlit secrets or env vars."""
     streamlit_secrets_found = False
     env_vars_found = False
+    finnhub_key_found = False
     
     try:
         # Check for nested Streamlit secrets structure
@@ -68,6 +69,11 @@ def verify_secrets():
             streamlit_secrets_found = True
         else:
             logger.warning("Complete credentials not found in Streamlit secrets")
+            
+        # Check for Finnhub key
+        if 'finnhub' in st.secrets and ('FINNHUB_KEY' in st.secrets['finnhub'] or 'FINNHUB_API_KEY' in st.secrets['finnhub']):
+            logger.info("Finnhub API key found in Streamlit secrets")
+            finnhub_key_found = True
     except Exception as e:
         logger.warning(f"Error accessing Streamlit secrets: {e}")
     
@@ -77,6 +83,13 @@ def verify_secrets():
         env_vars_found = True
     else:
         logger.warning("Complete credentials not found in environment variables")
+        
+    # Check for Finnhub key in environment variables
+    if os.getenv('FINNHUB_KEY') or os.getenv('FINNHUB_API_KEY'):
+        logger.info("Finnhub API key found in environment variables")
+        finnhub_key_found = True
+    
+    logger.info(f"Secrets verification: Streamlit secrets: {streamlit_secrets_found}, Env vars: {env_vars_found}, Finnhub key: {finnhub_key_found}")
     
     # Return True if either source has complete credentials
     return streamlit_secrets_found or env_vars_found
@@ -155,50 +168,73 @@ st.markdown("""
 
 # Load environment variables
 def load_environment_variables():
-    """Load environment variables from multiple sources."""
-    # First try to load from .env file
+    """
+    Load environment variables from different sources
+    
+    Tries to load from:
+    1. Streamlit secrets (preferred)
+    2. Environment variables
+    3. .env file (fallback)
+    
+    Returns:
+        str: Source of environment variables
+    """
+    source = "unknown"
+    
+    # Try loading from Streamlit secrets if available
+    if hasattr(st, 'secrets') and 'alpaca' in st.secrets:
+        os.environ["ALPACA_API_KEY"] = st.secrets.alpaca.ALPACA_API_KEY
+        os.environ["ALPACA_API_SECRET"] = st.secrets.alpaca.ALPACA_API_SECRET
+        
+        # Load other API keys if available
+        if 'finnhub' in st.secrets:
+            os.environ["FINNHUB_API_KEY"] = st.secrets.finnhub.FINNHUB_KEY
+            
+        if 'openai' in st.secrets:
+            os.environ["OPENAI_API_KEY"] = st.secrets.openai.OPENAI_KEY
+            
+        if 'alchemy' in st.secrets:
+            os.environ["ALCHEMY_API_KEY"] = st.secrets.alchemy.ALCHEMY_API_KEY
+            
+        # Set test mode for development
+        if os.environ.get("ALCHEMY_API_KEY") == "your-alchemy-api-key" or not os.environ.get("ALCHEMY_API_KEY"):
+            os.environ["ALCHEMY_TEST_MODE"] = "true"
+        
+        source = "Streamlit secrets (nested ALPACA_API_KEY)"
+        logger.info(f"Environment loaded from: {source}")
+        return source
+    
+    # Check for environment variables
+    if os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET'):
+        logger.info("ALPACA_API_KEY and ALPACA_API_SECRET found in environment variables")
+        env_vars_found = True
+        
+        # Also try to load other API keys from environment variables
+        if os.getenv('FINNHUB_KEY'):
+            os.environ["FINNHUB_API_KEY"] = os.getenv('FINNHUB_KEY')
+            logger.info("FINNHUB_KEY found in environment variables")
+        
+        source = "environment variables"
+        logger.info(f"Environment loaded from: {source}")
+        return source
+    
+    # Try to load from .env file
     load_dotenv()
     
-    # Create a dict to hold environment vars from all sources (for debugging)
-    env_vars = {
-        "from_env_file": {},
-        "from_streamlit": {},
-        "final": {}
-    }
-    
-    # Check for env vars loaded from .env file
     if os.getenv('ALPACA_API_KEY'):
-        env_vars["from_env_file"]["ALPACA_API_KEY"] = "Found"
-    if os.getenv('ALPACA_API_SECRET'):
-        env_vars["from_env_file"]["ALPACA_API_SECRET"] = "Found"
-    
-    # Try to check Streamlit secrets (which should be loaded automatically)
-    try:
-        if 'alpaca' in st.secrets:
-            if 'ALPACA_API_KEY' in st.secrets.alpaca:
-                env_vars["from_streamlit"]["ALPACA_API_KEY"] = "Found"
-            if 'ALPACA_API_SECRET' in st.secrets.alpaca:
-                env_vars["from_streamlit"]["ALPACA_API_SECRET"] = "Found"
+        env_vars_found = True
         
-        # Check final outcome (which credential source will be used)
-        # This mimics the logic in AlpacaAPI.__init__
-        if 'alpaca' in st.secrets:
-            if 'ALPACA_API_KEY' in st.secrets.alpaca:
-                env_vars["final"]["source"] = "Streamlit secrets (nested ALPACA_API_KEY)"
-            elif any(k in st.secrets.alpaca for k in ['api_key', 'key']):
-                env_vars["final"]["source"] = "Streamlit secrets (nested api_key/key)"
-        elif 'ALPACA_API_KEY' in st.secrets:
-            env_vars["final"]["source"] = "Streamlit secrets (top-level)"
-        elif os.getenv('ALPACA_API_KEY'):
-            env_vars["final"]["source"] = ".env file"
-        else:
-            env_vars["final"]["source"] = "None found"
-    except Exception as e:
-        logger.warning(f"Error checking Streamlit secrets: {e}")
-        env_vars["final"]["source"] = ".env file (error checking Streamlit)"
+        # Also check for other API keys in .env
+        if os.getenv('FINNHUB_KEY'):
+            os.environ["FINNHUB_API_KEY"] = os.getenv('FINNHUB_KEY')
+            logger.info("FINNHUB_KEY found in .env file")
+            
+        source = ".env file"
+        logger.info(f"Environment loaded from: {source}")
+        return source
     
-    logger.info(f"Environment loaded from: {env_vars['final']['source']}")
-    return env_vars
+    logger.warning("No environment variables found")
+    return source
 
 # Load environment variables and show what source was used
 env_sources = load_environment_variables()
@@ -414,6 +450,25 @@ def background_update():
                                 
                                 # Set a flag to indicate that new data is available for UI refresh
                                 st.session_state.data_updated = True
+                                
+                                # Pre-compute UI data in session state to minimize UI updates
+                                if not hasattr(st.session_state, 'ui_data_cache'):
+                                    st.session_state.ui_data_cache = {}
+                                
+                                # Update the UI data cache with the latest data
+                                # This way the fragment can use this data without calculation
+                                st.session_state.ui_data_cache = {
+                                    'last_check_time': st.session_state.trading_stats.get("last_check", None),
+                                    'next_check_time': st.session_state.trading_stats.get("next_check", None),
+                                    'cycles_completed': st.session_state.trading_stats.get("cycles_completed", 0),
+                                    'trades_executed': st.session_state.trading_stats.get("trades_executed", 0),
+                                    'last_update_time': st.session_state.last_update_time,
+                                    'update_timestamp': time.time()
+                                }
+                                
+                                # If trade conditions exist, add them to the cache
+                                if "trade_conditions" in st.session_state.trading_stats:
+                                    st.session_state.ui_data_cache['trade_conditions'] = st.session_state.trading_stats["trade_conditions"]
                                 
                                 # Mark the cycle as no longer running
                                 if cycle_lock_key in st.session_state.cycle_locks:
@@ -927,7 +982,6 @@ def _show_mock_portfolio_chart():
     """Show a mock portfolio chart when the real data cannot be loaded."""
     import pandas as pd
     from datetime import datetime, timedelta
-    import plotly.graph_objects as go
     
     # Create a placeholder empty chart with clear error message
     dates = pd.date_range(start=datetime.now() - timedelta(days=30), end=datetime.now(), freq='D')
@@ -1069,9 +1123,19 @@ def main():
             # Record UI update time
             st.session_state.last_ui_update_time = time.time()
             
-            # Force a rerun
-            st.rerun()
-            
+            # Instead of doing a full rerun (which causes dimming), just update the data in session state
+            if not hasattr(st.session_state, "in_progress_update") or not st.session_state.in_progress_update:
+                st.session_state.in_progress_update = True
+                # This ensures we don't trigger multiple updates in rapid succession
+                if hasattr(st.session_state, 'last_rerun_time') and time.time() - st.session_state.last_rerun_time < 1.0:
+                    # Skipping rerun because we just did one
+                    pass
+                else:
+                    # Only do a rerun if necessary
+                    st.session_state.last_rerun_time = time.time()
+                    st.rerun()
+                st.session_state.in_progress_update = False
+        
         # Ensure the update thread is running
         ensure_update_thread()
         
@@ -1152,6 +1216,25 @@ def main():
             st.session_state.refresh_interval = refresh_interval
             save_persistent_state({"refresh_interval": refresh_interval})
         
+        # Add a section for on-chain data settings
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("On-Chain Data Settings")
+        
+        # Test mode toggle for Alchemy API
+        alchemy_api_key = os.getenv("ALCHEMY_API_KEY", "")
+        if not alchemy_api_key or alchemy_api_key == "your-alchemy-api-key":
+            st.sidebar.warning("No Alchemy API key found. Using simulated data.")
+            test_mode = True
+        else:
+            test_mode = st.sidebar.checkbox(
+                "Use simulated on-chain data", 
+                value=os.getenv("ALCHEMY_TEST_MODE", "false").lower() == "true",
+                help="Toggle to use simulated data instead of real Alchemy API data"
+            )
+        
+        # Update test mode environment variable
+        os.environ["ALCHEMY_TEST_MODE"] = str(test_mode).lower()
+        
         # Create a container to show the last update time
         update_status = st.empty()
         if st.session_state.last_update_time:
@@ -1164,8 +1247,21 @@ def main():
         # This allows for updating the UI without a full page reload
         @st.fragment(run_every=refresh_interval)
         def auto_refresh_dashboard():
+            # Only fetch data when necessary, not on every UI update
+            # This helps prevent the UI dimming effect
+            data_needs_refresh = False
+            
+            # Check if we need to refresh data based on time since last update
+            if not hasattr(st.session_state, 'last_display_update_time') or \
+               time.time() - st.session_state.last_display_update_time >= 0.5:  # Limit UI updates to prevent dimming
+                data_needs_refresh = True
+                st.session_state.last_display_update_time = time.time()
+            
+            # Use cached data if possible to avoid recalculation
+            ui_data = getattr(st.session_state, 'ui_data_cache', {})
+            
             # Update the UI with latest data
-            if 'system' in st.session_state and 'trading_strategy' in st.session_state.system:
+            if 'system' in st.session_state and 'trading_strategy' in st.session_state.system and data_needs_refresh:
                 trading_strategy = st.session_state.system['trading_strategy']
                 
                 # Only run if trading is active
@@ -1175,8 +1271,9 @@ def main():
                         st.session_state.last_ui_update_time = time.time()
                         
                         # Update the last update time display
-                        if st.session_state.last_update_time:
-                            last_update = datetime.fromtimestamp(st.session_state.last_update_time)
+                        last_update_time = ui_data.get('last_update_time', st.session_state.last_update_time)
+                        if last_update_time:
+                            last_update = datetime.fromtimestamp(last_update_time)
                             update_status.info(f"Last data update: {last_update.strftime('%H:%M:%S')} (UI refresh count: {refresh_count})")
                         
                         # Update trading details in the designated container
@@ -1190,9 +1287,11 @@ def main():
                                 
                                 # Create an expandable section for trading details
                                 with st.expander("Auto-Trading Details", expanded=True):
-                                    # Display last check time and next check time
-                                    last_check_time = st.session_state.trading_stats.get("last_check", None)
-                                    next_check_time = st.session_state.trading_stats.get("next_check", None)
+                                    # Get data from cache if available
+                                    last_check_time = ui_data.get('last_check_time', 
+                                                              st.session_state.trading_stats.get("last_check", None))
+                                    next_check_time = ui_data.get('next_check_time',
+                                                             st.session_state.trading_stats.get("next_check", None))
                                     
                                     # Format the times for display
                                     last_check_str = last_check_time.strftime("%H:%M:%S") if last_check_time else "N/A"
@@ -1208,9 +1307,11 @@ def main():
                                         st.markdown("**Next check:**")
                                         st.markdown(f"<h3 style='margin-top:-10px'>{next_check_str}</h3>", unsafe_allow_html=True)
                                     
-                                    # Show trading stats
-                                    cycles_completed = st.session_state.trading_stats.get("cycles_completed", 0)
-                                    trades_executed = st.session_state.trading_stats.get("trades_executed", 0)
+                                    # Show trading stats from cache if available
+                                    cycles_completed = ui_data.get('cycles_completed',
+                                                               st.session_state.trading_stats.get("cycles_completed", 0))
+                                    trades_executed = ui_data.get('trades_executed',
+                                                              st.session_state.trading_stats.get("trades_executed", 0))
                                     
                                     stats_cols = st.columns(2)
                                     with stats_cols[0]:
@@ -1230,7 +1331,11 @@ def main():
                                 signal_strength = 0.0
                                 signal_direction = "neutral"
                                 
-                                if "trade_conditions" in st.session_state.trading_stats:
+                                if "trade_conditions" in ui_data:
+                                    conditions = ui_data["trade_conditions"]
+                                    signal_strength = abs(conditions.get("signal_strength", 0))
+                                    signal_direction = conditions.get("signal_direction", "neutral")
+                                elif "trade_conditions" in st.session_state.trading_stats:
                                     conditions = st.session_state.trading_stats["trade_conditions"]
                                     signal_strength = abs(conditions.get("signal_strength", 0))
                                     signal_direction = conditions.get("signal_direction", "neutral")
@@ -1246,9 +1351,8 @@ def main():
                                 st.markdown(f"**Direction:** <span style='color:{direction_color}'>{signal_direction}</span>", unsafe_allow_html=True)
                                 
                                 # Signal component visualization
-                                if "trade_conditions" in st.session_state.trading_stats:
-                                    conditions = st.session_state.trading_stats["trade_conditions"]
-                                    
+                                if "trade_conditions" in ui_data:
+                                    conditions = ui_data["trade_conditions"]
                                     # Create columns for each component
                                     component_cols = st.columns(4)
                                     
@@ -1287,7 +1391,25 @@ def main():
                                     
                                     with component_cols[3]:
                                         signal_indicator(conditions.get("sentiment", 0), "Sentiment")
-
+                                elif "trade_conditions" in st.session_state.trading_stats:
+                                    conditions = st.session_state.trading_stats["trade_conditions"]
+                                    # Create columns for each component
+                                    component_cols = st.columns(4)
+                                    
+                                    # Helper function to display a signal component (defined above)
+                                    # Display each component
+                                    with component_cols[0]:
+                                        signal_indicator(conditions.get("trend", 0), "Trend")
+                                    
+                                    with component_cols[1]:
+                                        signal_indicator(conditions.get("momentum", 0), "Momentum")
+                                    
+                                    with component_cols[2]:
+                                        signal_indicator(conditions.get("volume", 0), "Volume")
+                                    
+                                    with component_cols[3]:
+                                        signal_indicator(conditions.get("sentiment", 0), "Sentiment")
+                        
                         # Reset the data updated flag after refreshing the UI
                         if hasattr(st.session_state, 'data_updated') and st.session_state.data_updated:
                             st.session_state.data_updated = False
@@ -1604,7 +1726,7 @@ def main():
                         st.subheader("Trading Signals")
                         
                         # Create a tab structure for different signal categories
-                        signal_tabs = st.tabs(["Technical", "Sentiment", "Risk"])
+                        signal_tabs = st.tabs(["Technical", "Sentiment", "Risk", "On-Chain Metrics"])
                         
                         with signal_tabs[0]:  # Technical tab
                             signal_cols = st.columns(3)
@@ -1655,6 +1777,210 @@ def main():
                                 risk_reward_val = signals.get('risk_reward', 0)
                                 risk_reward_display = f"{risk_reward_val:.2f}" if not np.isnan(risk_reward_val) else "0.00"
                                 st.metric("Risk/Reward", risk_reward_display)
+                                
+                        with signal_tabs[3]:  # On-Chain Metrics tab
+                            # Import on-chain data sources
+                            from on_chain.alchemy.client import AlchemyClient
+                            from on_chain.whale_tracker import WhaleTracker
+                            from on_chain.exchange_flow import ExchangeFlowAnalyzer
+                            from on_chain.network_metrics import NetworkMetricsAnalyzer
+                            
+                            # Create three sections for different on-chain data
+                            onchain_sections = st.tabs(["Network Health", "Whale Activity", "Exchange Flow"])
+                            
+                            with onchain_sections[0]:  # Network Health
+                                try:
+                                    # Initialize network metrics analyzer with Alchemy client
+                                    network_analyzer = NetworkMetricsAnalyzer()
+                                    
+                                    # Get network health data
+                                    network_data = network_analyzer.get_network_health()
+                                    
+                                    # Check if test mode is enabled
+                                    is_mock_data = network_data.get('is_mock_data', False)
+                                    if is_mock_data:
+                                        st.warning("⚠️ Using simulated network data. Connect your Alchemy API key for real-time data.", icon="⚠️")
+                                    
+                                    # Create 3 columns for key metrics
+                                    net_cols = st.columns(3)
+                                    
+                                    with net_cols[0]:
+                                        gas_price = network_data.get('gas_prices', {}).get('standard', 0)
+                                        st.metric("Gas Price", f"{gas_price} Gwei")
+                                        
+                                    with net_cols[1]:
+                                        health_score = network_data.get('health_score', 0)
+                                        st.metric("Network Health", f"{health_score}/100")
+                                        
+                                    with net_cols[2]:
+                                        congestion = network_data.get('congestion_level', 'unknown')
+                                        st.metric("Network Congestion", f"{congestion.capitalize()}")
+                                    
+                                    # Add gas price forecast
+                                    st.subheader("Gas Price Forecast")
+                                    gas_forecast = {
+                                        "Slow (>5 min)": network_data.get('gas_prices', {}).get('slow', 0),
+                                        "Standard (1-3 min)": network_data.get('gas_prices', {}).get('standard', 0),
+                                        "Fast (<1 min)": network_data.get('gas_prices', {}).get('fast', 0),
+                                        "Instant (<15 sec)": network_data.get('gas_prices', {}).get('standard', 0) * 1.5
+                                    }
+                                    
+                                    # Create a horizontal bar chart for gas prices
+                                    gas_fig = go.Figure()
+                                    
+                                    # Add bars for each speed level
+                                    colors = ["#90CAF9", "#64B5F6", "#42A5F5", "#2196F3"]
+                                    for i, (speed, price) in enumerate(gas_forecast.items()):
+                                        gas_fig.add_trace(go.Bar(
+                                            y=[speed],
+                                            x=[price],
+                                            orientation='h',
+                                            marker=dict(color=colors[i]),
+                                            name=speed,
+                                            text=[f"{price:.1f} Gwei"],
+                                            textposition='inside'
+                                        ))
+                                    
+                                    gas_fig.update_layout(
+                                        title="Transaction Priority Fee by Speed",
+                                        xaxis_title="Gas Price (Gwei)",
+                                        height=250,
+                                        template="plotly_dark",
+                                        showlegend=False
+                                    )
+                                    
+                                    st.plotly_chart(gas_fig, use_container_width=True)
+                                    
+                                except Exception as e:
+                                    st.error(f"Error loading network metrics: {str(e)}")
+                                    st.info("Network health data will be available here after fully integrating the Alchemy API.")
+                            
+                            with onchain_sections[1]:  # Whale Activity
+                                try:
+                                    # Initialize whale tracker
+                                    whale_tracker = WhaleTracker()
+                                    
+                                    # Get whale transaction data for ETH
+                                    whale_data = whale_tracker.track_whale_transactions("eth", 24)
+                                    
+                                    # Check if mock data is being used
+                                    is_mock_data = whale_data.get('is_mock_data', False)
+                                    if is_mock_data:
+                                        st.warning("⚠️ Using simulated whale data. Connect your Alchemy API key for real-time data.", icon="⚠️")
+                                    
+                                    # Show whale metrics
+                                    st.subheader("ETH Whale Transactions (24h)")
+                                    
+                                    # Whale metrics in columns
+                                    whale_cols = st.columns(3)
+                                    
+                                    with whale_cols[0]:
+                                        whale_count = whale_data.get('whale_count', 0)
+                                        st.metric("Whale Transactions", f"{whale_count}")
+                                        
+                                    with whale_cols[1]:
+                                        whale_volume = whale_data.get('whale_volume', 0)
+                                        whale_volume_pct = whale_data.get('whale_volume_percent', 0)
+                                        st.metric("Whale Volume", f"{whale_volume:.1f} ETH", f"{whale_volume_pct:.1f}% of total")
+                                        
+                                    with whale_cols[2]:
+                                        buy_count = whale_data.get('buy_count', 0)
+                                        sell_count = whale_data.get('sell_count', 0)
+                                        buy_sell_ratio = buy_count / sell_count if sell_count > 0 else 0
+                                        st.metric("Buy/Sell Ratio", f"{buy_sell_ratio:.2f}", f"{buy_count} buys, {sell_count} sells")
+                                    
+                                    # Show recent whale transactions
+                                    st.subheader("Recent Whale Transactions")
+                                    
+                                    # Get up to 5 transactions
+                                    whale_txs = whale_data.get('transactions', [])[:5]
+                                    
+                                    if whale_txs:
+                                        # Create a table of transactions
+                                        tx_data = []
+                                        for tx in whale_txs:
+                                            tx_data.append({
+                                                "Amount (ETH)": f"{tx.get('value', 0):.2f}",
+                                                "USD Value": f"${tx.get('usd_value', 0):,.0f}",
+                                                "Type": "Exchange In" if tx.get('to', '').lower() in ['exchange'] else "Exchange Out" if tx.get('from', '').lower() in ['exchange'] else "Wallet to Wallet",
+                                                "Time": tx.get('timestamp', '')
+                                            })
+                                        
+                                        # Convert to DataFrame for display
+                                        import pandas as pd
+                                        tx_df = pd.DataFrame(tx_data)
+                                        st.dataframe(tx_df, use_container_width=True)
+                                    else:
+                                        st.info("No whale transactions detected in the last 24 hours.")
+                                    
+                                except Exception as e:
+                                    st.error(f"Error loading whale transaction data: {str(e)}")
+                                    st.info("Whale activity data will be available here after fully integrating the Alchemy API.")
+                            
+                            with onchain_sections[2]:  # Exchange Flow
+                                try:
+                                    # Initialize exchange flow analyzer
+                                    exchange_analyzer = ExchangeFlowAnalyzer()
+                                    
+                                    # Get exchange flow data for ETH
+                                    flow_data = exchange_analyzer.get_exchange_flows("eth", 24)
+                                    
+                                    # Check if mock data is being used
+                                    is_mock_data = flow_data.get('is_mock_data', False)
+                                    if is_mock_data:
+                                        st.warning("⚠️ Using simulated exchange flow data. Connect your Alchemy API key for real-time data.", icon="⚠️")
+                                    
+                                    # Exchange flow metrics
+                                    st.subheader("ETH Exchange Flows (24h)")
+                                    
+                                    # Create metrics in columns
+                                    flow_cols = st.columns(3)
+                                    
+                                    with flow_cols[0]:
+                                        inflow = flow_data.get('inflow', {}).get('volume', 0)
+                                        st.metric("Exchange Inflow", f"{inflow:.2f} ETH")
+                                        
+                                    with flow_cols[1]:
+                                        outflow = flow_data.get('outflow', {}).get('volume', 0)
+                                        st.metric("Exchange Outflow", f"{outflow:.2f} ETH")
+                                        
+                                    with flow_cols[2]:
+                                        net_flow = flow_data.get('net_flow', 0)
+                                        flow_trend = flow_data.get('trend', 'neutral')
+                                        trend_message = 'Bullish Signal' if flow_trend == 'exchange_outflow' else 'Bearish Signal' if flow_trend == 'exchange_inflow' else 'Neutral'
+                                        st.metric("Net Flow", f"{net_flow:.2f} ETH", trend_message)
+                                    
+                                    # Create a simple bar chart showing inflow vs outflow
+                                    flow_fig = go.Figure()
+                                    
+                                    # Add bars
+                                    flow_fig.add_trace(go.Bar(
+                                        x=["Inflow", "Outflow"],
+                                        y=[inflow, outflow],
+                                        marker_color=["#FF5252", "#4CAF50"]
+                                    ))
+                                    
+                                    flow_fig.update_layout(
+                                        title="Exchange Flow Comparison",
+                                        yaxis_title="Amount (ETH)",
+                                        height=300,
+                                        template="plotly_dark"
+                                    )
+                                    
+                                    st.plotly_chart(flow_fig, use_container_width=True)
+                                    
+                                    # Add explanation of what this means
+                                    flow_trend = flow_data.get('trend', 'neutral')
+                                    if flow_trend == 'exchange_outflow':
+                                        st.success("Net outflow from exchanges is typically bullish as tokens are moved to private wallets for holding.")
+                                    elif flow_trend == 'exchange_inflow':
+                                        st.warning("Net inflow to exchanges is typically bearish as tokens are moved to exchanges for potential selling.")
+                                    else:
+                                        st.info("Balanced flow between exchanges indicates a neutral market sentiment.")
+                                    
+                                except Exception as e:
+                                    st.error(f"Error loading exchange flow data: {str(e)}")
+                                    st.info("Exchange flow data will be available here after fully integrating the Alchemy API.")
                         
                         # Overall signal
                         signal_value = signals.get('signal', 0)
@@ -2458,6 +2784,162 @@ def main():
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
+            
+            # On-Chain Market Insights
+            st.subheader("On-Chain Market Insights")
+            
+            onchain_col1, onchain_col2 = st.columns([1, 1])
+            
+            with onchain_col1:
+                # Show whale transaction summary
+                try:
+                    from on_chain.whale_tracker import WhaleTracker
+                    whale_tracker = WhaleTracker()
+                    
+                    # Get signal from whale data (simplify display)
+                    whale_signals = whale_tracker.get_whale_signals("eth", 24)
+                    
+                    # Create a nice card for displaying whale signals
+                    whale_score = whale_signals.get('net_whale_sentiment', 0)
+                    whale_color = "#4CAF50" if whale_score > 0.2 else "#F44336" if whale_score < -0.2 else "#FFC107"
+                    whale_direction = "Bullish" if whale_score > 0.2 else "Bearish" if whale_score < -0.2 else "Neutral"
+                    
+                    # Create a gauge-like display
+                    st.subheader("Whale Activity Signal")
+                    
+                    # Normalize score to 0-100 range for progress bar
+                    normalized_score = (whale_score + 1) * 50  # Convert from -1/+1 to 0-100
+                    normalized_score = max(0, min(100, normalized_score))  # Ensure within range
+                    
+                    st.progress(normalized_score/100)
+                    
+                    # Text description
+                    st.markdown(f"""
+                    <div style="background-color: {whale_color}; padding: 10px; border-radius: 5px; text-align: center;">
+                        <span style="color: white; font-weight: bold; font-size: 1.2em;">{whale_direction} ({whale_score:.2f})</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Detail metrics
+                    st.markdown("### Key Metrics")
+                    
+                    whale_buy_volume = whale_signals.get('buy_volume_ratio', 0.5)
+                    whale_activity = whale_signals.get('whale_activity', 0.5)
+                    
+                    metric_cols = st.columns(2)
+                    with metric_cols[0]:
+                        st.metric("Buy/Sell Ratio", f"{whale_buy_volume:.2f}", 
+                                 f"{'More buying' if whale_buy_volume > 0.5 else 'More selling'}")
+                    with metric_cols[1]:
+                        st.metric("Whale Activity", f"{whale_activity:.2f}",
+                                 f"{'High' if whale_activity > 0.7 else 'Medium' if whale_activity > 0.3 else 'Low'}")
+                    
+                except Exception as e:
+                    st.error(f"Error loading whale signal data: {str(e)}")
+                    st.info("Whale transaction metrics will appear here when properly integrated with Alchemy API.")
+            
+            with onchain_col2:
+                # Show Exchange Flow Analysis
+                try:
+                    from on_chain.exchange_flow import ExchangeFlowAnalyzer
+                    flow_analyzer = ExchangeFlowAnalyzer()
+                    
+                    # Get exchange flow signal
+                    flow_signals = flow_analyzer.get_exchange_flow_signals("eth", 24)
+                    
+                    # Create visualization
+                    st.subheader("Exchange Flow Signal")
+                    
+                    flow_score = flow_signals.get('exchange_flow_sentiment', 0)
+                    flow_color = "#4CAF50" if flow_score > 0.2 else "#F44336" if flow_score < -0.2 else "#FFC107"
+                    flow_direction = "Bullish" if flow_score > 0.2 else "Bearish" if flow_score < -0.2 else "Neutral"
+                    
+                    # Normalize score for progress bar
+                    normalized_flow = (flow_score + 1) * 50  # Convert from -1/+1 to 0-100
+                    normalized_flow = max(0, min(100, normalized_flow))  # Ensure within range
+                    
+                    st.progress(normalized_flow/100)
+                    
+                    # Text description
+                    st.markdown(f"""
+                    <div style="background-color: {flow_color}; padding: 10px; border-radius: 5px; text-align: center;">
+                        <span style="color: white; font-weight: bold; font-size: 1.2em;">{flow_direction} ({flow_score:.2f})</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Detail metrics
+                    st.markdown("### Key Metrics")
+                    
+                    net_flow_ratio = flow_signals.get('net_flow_ratio', 0.5)
+                    inflow_change = flow_signals.get('inflow_change_24h', 0)
+                    
+                    metric_cols = st.columns(2)
+                    with metric_cols[0]:
+                        st.metric("Net Flow Ratio", f"{net_flow_ratio:.2f}", 
+                                 f"{'Outflow dominant' if net_flow_ratio < 0.5 else 'Inflow dominant'}")
+                    with metric_cols[1]:
+                        st.metric("24h Inflow Change", f"{inflow_change:.2f}%",
+                                 f"{'Increasing' if inflow_change > 0 else 'Decreasing'}")
+                    
+                except Exception as e:
+                    st.error(f"Error loading exchange flow data: {str(e)}")
+                    st.info("Exchange flow metrics will appear here when properly integrated with Alchemy API.")
+            
+            # Network health metrics
+            st.subheader("Network Health")
+            
+            try:
+                from on_chain.network_metrics import NetworkMetricsAnalyzer
+                network_analyzer = NetworkMetricsAnalyzer()
+                
+                # Get network health data
+                network_data = network_analyzer.get_network_health()
+                
+                # Show gas price and network metrics in columns
+                net_cols = st.columns(3)
+                
+                with net_cols[0]:
+                    gas_price = network_data.get('gas_price_gwei', 0)
+                    gas_24h_change = network_data.get('gas_price_change_24h', 0)
+                    st.metric("Gas Price", f"{gas_price} Gwei", f"{gas_24h_change:.1f}% 24h change")
+                    
+                with net_cols[1]:
+                    txn_count = network_data.get('transaction_count_24h', 0)
+                    txn_change = network_data.get('transaction_count_change_24h', 0)
+                    st.metric("24h Transactions", f"{txn_count:,}", f"{txn_change:.1f}% change")
+                    
+                with net_cols[2]:
+                    # Network congestion index (0-100)
+                    congestion = network_data.get('network_congestion', 50)
+                    congestion_text = "High" if congestion > 75 else "Medium" if congestion > 25 else "Low"
+                    st.metric("Network Congestion", f"{congestion_text} ({congestion}%)")
+                
+                # Show gas price forecast for different transaction speeds
+                gas_speeds = network_data.get('gas_price_speeds', {
+                    'slow': network_data.get('gas_price_slow', gas_price * 0.8),
+                    'standard': network_data.get('gas_price_standard', gas_price),
+                    'fast': network_data.get('gas_price_fast', gas_price * 1.2),
+                    'instant': network_data.get('gas_price_instant', gas_price * 1.5)
+                })
+                
+                gas_cols = st.columns(4)
+                
+                with gas_cols[0]:
+                    slow_price = gas_speeds.get('slow', 0)
+                    st.metric("Slow (~5 min)", f"{slow_price:.1f} Gwei")
+                with gas_cols[1]:
+                    std_price = gas_speeds.get('standard', 0)
+                    st.metric("Standard (~1 min)", f"{std_price:.1f} Gwei")
+                with gas_cols[2]:
+                    fast_price = gas_speeds.get('fast', 0)
+                    st.metric("Fast (~30 sec)", f"{fast_price:.1f} Gwei")
+                with gas_cols[3]:
+                    instant_price = gas_speeds.get('instant', 0)
+                    st.metric("Instant (<15 sec)", f"{instant_price:.1f} Gwei")
+                    
+            except Exception as e:
+                st.error(f"Error loading network health data: {str(e)}")
+                st.info("Network health metrics will appear here when properly integrated with Alchemy API.")
             
             # Risk metrics
             st.subheader("Risk Metrics")

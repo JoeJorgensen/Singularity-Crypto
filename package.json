@@ -1,0 +1,23 @@
+{
+  "name": "cryptotrader",
+  "version": "1.0.0",
+  "description": "An advanced cryptocurrency trading bot with technical analysis, sentiment analysis, and risk management capabilities.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JoeJorgensen/Singularity-Crypto.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/JoeJorgensen/Singularity-Crypto/issues"
+  },
+  "homepage": "https://github.com/JoeJorgensen/Singularity-Crypto#readme",
+  "dependencies": {
+    "alchemy-sdk": "^3.5.6"
+  }
+}

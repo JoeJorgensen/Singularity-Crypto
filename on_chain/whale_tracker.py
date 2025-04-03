@@ -1,446 +1,322 @@
 """
-WhaleTracker - Track large cryptocurrency transactions and whale activity.
+Whale tracker for monitoring large cryptocurrency transactions
 """
-from typing import Dict, List, Any, Optional
-import os
+import logging
 import time
-import json
-import random
+import os
+from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
-import pandas as pd
-from dotenv import load_dotenv
+import numpy as np
+from .alchemy.client import AlchemyClient
 
-# Load environment variables
-load_dotenv()
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Whale thresholds (in USD equivalent)
+WHALE_THRESHOLDS = {
+    "eth": 100000,  # $100k+ for ETH
+    "btc": 250000,  # $250k+ for BTC
+    "usdt": 500000,  # $500k+ for stablecoins
+    "usdc": 500000,
+    "link": 50000,  # $50k+ for alts
+    "uni": 50000,
+    "aave": 50000,
+}
 
 class WhaleTracker:
     """
-    Track large cryptocurrency transactions and whale activity.
-    This is a simulated implementation, as real on-chain data would require
-    integration with blockchain APIs and data providers.
+    Tracks and analyzes large cryptocurrency transactions
     """
     
     def __init__(self):
-        """Initialize whale activity tracker."""
-        self.cache = {}
-        self.cache_expiry = 1800  # 30 minutes
-        self.whale_thresholds = {
-            'BTC': 50,       # 50+ BTC is considered a whale transaction
-            'ETH': 500,      # 500+ ETH is considered a whale transaction
-            'SOL': 10000,    # 10,000+ SOL is considered a whale transaction
-            'XRP': 100000,   # 100,000+ XRP is considered a whale transaction
-            'default': 100000  # Default value in USD
-        }
-        self.simulated_data = self._initialize_simulated_data()
-    
-    def _initialize_simulated_data(self) -> Dict[str, Any]:
-        """
-        Initialize simulated whale activity data for common cryptocurrencies.
+        """Initialize the whale tracker"""
+        self.alchemy_client = AlchemyClient()
+        self.whale_txs_cache = {}
+        self.cache_timestamp = 0
+        self.cache_duration = 600  # 10 minutes cache
+        self.price_cache = {}
         
-        Returns:
-            Dictionary with simulated data
+    def get_token_price(self, token_symbol: str) -> float:
         """
-        now = datetime.now()
+        Get the current price of a token in USD
         
-        # Create mock data for top coins
-        return {
-            'BTC': {
-                'whale_transactions': [
-                    {
-                        'timestamp': (now - timedelta(hours=22)).isoformat(),
-                        'amount': 125,
-                        'value_usd': 7500000,
-                        'from_exchange': False,
-                        'to_exchange': False,
-                        'transaction_type': 'transfer'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=16)).isoformat(),
-                        'amount': 85,
-                        'value_usd': 5100000,
-                        'from_exchange': True,
-                        'to_exchange': False,
-                        'transaction_type': 'withdrawal'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=8)).isoformat(),
-                        'amount': 200,
-                        'value_usd': 12000000,
-                        'from_exchange': False,
-                        'to_exchange': False,
-                        'transaction_type': 'transfer'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=3)).isoformat(),
-                        'amount': 75,
-                        'value_usd': 4500000,
-                        'from_exchange': False,
-                        'to_exchange': True,
-                        'transaction_type': 'deposit'
-                    }
-                ],
-                'total_whale_outflows_24h': 210,
-                'total_whale_inflows_24h': 75,
-                'unique_active_whales': 18,
-                'whale_sentiment': 'accumulation'  # More outflows than inflows
-            },
-            'ETH': {
-                'whale_transactions': [
-                    {
-                        'timestamp': (now - timedelta(hours=23)).isoformat(),
-                        'amount': 1200,
-                        'value_usd': 3600000,
-                        'from_exchange': True,
-                        'to_exchange': False,
-                        'transaction_type': 'withdrawal'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=18)).isoformat(),
-                        'amount': 850,
-                        'value_usd': 2550000,
-                        'from_exchange': False,
-                        'to_exchange': False,
-                        'transaction_type': 'transfer'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=10)).isoformat(),
-                        'amount': 1500,
-                        'value_usd': 4500000,
-                        'from_exchange': False,
-                        'to_exchange': True,
-                        'transaction_type': 'deposit'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=4)).isoformat(),
-                        'amount': 2000,
-                        'value_usd': 6000000,
-                        'from_exchange': False,
-                        'to_exchange': True,
-                        'transaction_type': 'deposit'
-                    }
-                ],
-                'total_whale_outflows_24h': 2050,
-                'total_whale_inflows_24h': 3500,
-                'unique_active_whales': 12,
-                'whale_sentiment': 'distribution'  # More inflows than outflows (to exchanges)
-            },
-            'SOL': {
-                'whale_transactions': [
-                    {
-                        'timestamp': (now - timedelta(hours=21)).isoformat(),
-                        'amount': 35000,
-                        'value_usd': 3150000,
-                        'from_exchange': True,
-                        'to_exchange': False,
-                        'transaction_type': 'withdrawal'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=15)).isoformat(),
-                        'amount': 22000,
-                        'value_usd': 1980000,
-                        'from_exchange': False,
-                        'to_exchange': False,
-                        'transaction_type': 'transfer'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=12)).isoformat(),
-                        'amount': 18000,
-                        'value_usd': 1620000,
-                        'from_exchange': False,
-                        'to_exchange': True,
-                        'transaction_type': 'deposit'
-                    },
-                    {
-                        'timestamp': (now - timedelta(hours=5)).isoformat(),
-                        'amount': 40000,
-                        'value_usd': 3600000,
-                        'from_exchange': True,
-                        'to_exchange': False,
-                        'transaction_type': 'withdrawal'
-                    }
-                ],
-                'total_whale_outflows_24h': 75000,
-                'total_whale_inflows_24h': 18000,
-                'unique_active_whales': 9,
-                'whale_sentiment': 'accumulation'  # More outflows than inflows
-            }
-        }
-    
-    def analyze(self, symbol: str) -> Dict[str, Any]:
-        """
-        Analyze whale activity for a specific cryptocurrency.
+        This is a simplified implementation. In production, you'd use a proper price feed.
         
         Args:
-            symbol: Cryptocurrency symbol (e.g., 'BTC')
+            token_symbol: Symbol of the token
             
         Returns:
-            Dictionary with whale activity analysis
+            float: Token price in USD
         """
-        # Clean symbol
-        symbol = symbol.upper()
-        if '/' in symbol:
-            symbol = symbol.split('/')[0]
+        # Check cache first
+        if token_symbol in self.price_cache and (time.time() - self.price_cache[token_symbol]["timestamp"] < 3600):
+            return self.price_cache[token_symbol]["price"]
         
-        # Check cache
-        cache_key = f"whale_activity:{symbol}"
-        if cache_key in self.cache:
-            cache_entry = self.cache[cache_key]
-            if time.time() - cache_entry['timestamp'] < self.cache_expiry:
-                return cache_entry['data']
-        
-        # Prepare result
-        result = {
-            'symbol': symbol,
-            'timestamp': datetime.now().isoformat(),
-            'whale_transactions_24h': [],
-            'total_whale_outflows_24h': 0,
-            'total_whale_inflows_24h': 0,
-            'net_whale_flow': 0,
-            'whale_activity_level': 'low',
-            'whale_sentiment': 'neutral',
-            'activity_score': 0  # -1 to 1 scale
+        # Simple placeholder prices - in production, use a real price API
+        current_prices = {
+            "eth": 2000.0,
+            "btc": 35000.0,
+            "usdt": 1.0,
+            "usdc": 1.0,
+            "link": 7.0,
+            "uni": 5.0,
+            "aave": 80.0,
         }
         
-        try:
-            # Use simulated data for common cryptocurrencies
-            if symbol in self.simulated_data:
-                data = self.simulated_data[symbol]
-                
-                # Calculate net whale flow (negative = more outflows = accumulation)
-                outflows = data['total_whale_outflows_24h']
-                inflows = data['total_whale_inflows_24h']
-                net_flow = inflows - outflows
-                
-                # Normalize to -1 to 1 scale
-                max_flow = max(inflows, outflows)
-                if max_flow > 0:
-                    activity_score = -1 * net_flow / max_flow  # Negative to maintain: negative = accumulation = bullish
-                else:
-                    activity_score = 0
-                
-                # Determine activity level
-                activity_level = 'medium'
-                if len(data['whale_transactions']) > 5:
-                    activity_level = 'high'
-                elif len(data['whale_transactions']) < 3:
-                    activity_level = 'low'
-                
-                # Update result
-                result['whale_transactions_24h'] = data['whale_transactions']
-                result['total_whale_outflows_24h'] = outflows
-                result['total_whale_inflows_24h'] = inflows
-                result['net_whale_flow'] = net_flow
-                result['whale_activity_level'] = activity_level
-                result['whale_sentiment'] = data['whale_sentiment']
-                result['activity_score'] = activity_score
-            else:
-                # Generate random data for other cryptocurrencies
-                transactions = []
-                outflows = 0
-                inflows = 0
-                
-                # Generate random transactions
-                for _ in range(random.randint(1, 5)):
-                    amount = random.randint(50, 500)
-                    is_inflow = random.choice([True, False])
-                    
-                    transaction = {
-                        'timestamp': (datetime.now() - timedelta(hours=random.randint(1, 24))).isoformat(),
-                        'amount': amount,
-                        'value_usd': amount * 1000,  # Simplified calculation
-                        'from_exchange': is_inflow,
-                        'to_exchange': not is_inflow,
-                        'transaction_type': 'deposit' if is_inflow else 'withdrawal'
-                    }
-                    
-                    transactions.append(transaction)
-                    
-                    if is_inflow:
-                        inflows += amount
-                    else:
-                        outflows += amount
-                
-                # Calculate net flow and activity score
-                net_flow = inflows - outflows
-                max_flow = max(inflows, outflows)
-                if max_flow > 0:
-                    activity_score = -1 * net_flow / max_flow
-                else:
-                    activity_score = 0
-                
-                # Determine whale sentiment
-                sentiment = 'neutral'
-                if activity_score > 0.3:
-                    sentiment = 'accumulation'
-                elif activity_score < -0.3:
-                    sentiment = 'distribution'
-                
-                # Determine activity level
-                activity_level = 'medium'
-                if len(transactions) > 3:
-                    activity_level = 'high'
-                elif len(transactions) < 2:
-                    activity_level = 'low'
-                
-                # Update result
-                result['whale_transactions_24h'] = transactions
-                result['total_whale_outflows_24h'] = outflows
-                result['total_whale_inflows_24h'] = inflows
-                result['net_whale_flow'] = net_flow
-                result['whale_activity_level'] = activity_level
-                result['whale_sentiment'] = sentiment
-                result['activity_score'] = activity_score
-        
-        except Exception as e:
-            print(f"Error analyzing whale activity: {e}")
+        price = current_prices.get(token_symbol.lower(), 0)
         
         # Update cache
-        self.cache[cache_key] = {
-            'timestamp': time.time(),
-            'data': result
+        self.price_cache[token_symbol] = {
+            "price": price,
+            "timestamp": time.time()
         }
         
-        return result
+        return price
     
-    def get_recent_transactions(self, symbol: str, limit: int = 10) -> List[Dict]:
+    def track_whale_transactions(self, token_symbol: str, hours: int = 24) -> Dict[str, Any]:
         """
-        Get recent whale transactions for a specific cryptocurrency.
+        Track large transactions for a specific token
         
         Args:
-            symbol: Cryptocurrency symbol (e.g., 'BTC')
-            limit: Maximum number of transactions to return
+            token_symbol: Symbol of the token to track (e.g., 'ETH', 'BTC')
+            hours: Number of hours to look back
             
         Returns:
-            List of recent whale transactions
+            Dict containing whale transaction metrics
         """
-        # Clean symbol
-        symbol = symbol.upper()
-        if '/' in symbol:
-            symbol = symbol.split('/')[0]
+        # Use cache if available and not expired
+        cache_key = f"{token_symbol}_{hours}"
+        current_time = time.time()
         
-        transactions = []
+        if cache_key in self.whale_txs_cache and (current_time - self.cache_timestamp < self.cache_duration):
+            logger.debug(f"Using cached whale transaction data for {token_symbol}")
+            return self.whale_txs_cache[cache_key]
         
-        try:
-            # Use simulated data for common cryptocurrencies
-            if symbol in self.simulated_data:
-                data = self.simulated_data[symbol]
-                transactions = data['whale_transactions'][:limit]
-            else:
-                # Generate random transactions
-                for _ in range(min(limit, random.randint(1, 5))):
-                    amount = random.randint(50, 500)
-                    is_inflow = random.choice([True, False])
-                    
-                    transaction = {
-                        'timestamp': (datetime.now() - timedelta(hours=random.randint(1, 24))).isoformat(),
-                        'amount': amount,
-                        'value_usd': amount * 1000,  # Simplified calculation
-                        'from_exchange': is_inflow,
-                        'to_exchange': not is_inflow,
-                        'transaction_type': 'deposit' if is_inflow else 'withdrawal'
-                    }
-                    
-                    transactions.append(transaction)
+        logger.info(f"Tracking whale transactions for {token_symbol} over past {hours} hours")
         
-        except Exception as e:
-            print(f"Error getting recent whale transactions: {e}")
+        # Get token price
+        token_price = self.get_token_price(token_symbol)
         
-        return transactions
-    
-    def get_whale_trend(self, symbol: str, days: int = 7) -> Dict[str, Any]:
-        """
-        Get whale activity trend for a specific cryptocurrency.
+        # Get whale threshold in token amount
+        usd_threshold = WHALE_THRESHOLDS.get(token_symbol.lower(), 100000)
+        token_threshold = usd_threshold / token_price if token_price > 0 else 0
         
-        Args:
-            symbol: Cryptocurrency symbol (e.g., 'BTC')
-            days: Number of days for trend analysis
-            
-        Returns:
-            Dictionary with whale activity trend analysis
-        """
-        # Clean symbol
-        symbol = symbol.upper()
-        if '/' in symbol:
-            symbol = symbol.split('/')[0]
+        # Check if using test mode
+        is_mock_data = os.getenv("ALCHEMY_TEST_MODE", "false").lower() == "true"
         
-        result = {
-            'symbol': symbol,
-            'days_analyzed': days,
-            'overall_trend': 'neutral',
-            'daily_stats': [],
-            'whale_count_trend': 'stable',
-            'accumulation_days': 0,
-            'distribution_days': 0,
-            'neutral_days': 0
-        }
+        # Calculate block range (approximate)
+        # Assuming ~12 second block time for Ethereum
+        blocks_per_hour = 3600 // 12
+        current_block = self.alchemy_client.get_block_number()
+        from_block = current_block - (blocks_per_hour * hours)
         
-        try:
-            now = datetime.now()
-            
-            # Generate daily stats
-            accumulation_days = 0
-            distribution_days = 0
-            neutral_days = 0
-            
-            for i in range(days):
-                date = now - timedelta(days=i)
-                
-                # Randomly determine daily sentiment
-                random_value = random.uniform(-1, 1)
-                
-                # For common cryptos, bias the sentiment based on their overall simulated trend
-                if symbol in self.simulated_data:
-                    if self.simulated_data[symbol]['whale_sentiment'] == 'accumulation':
-                        random_value = random.uniform(0, 1)  # Bias towards accumulation
-                    elif self.simulated_data[symbol]['whale_sentiment'] == 'distribution':
-                        random_value = random.uniform(-1, 0)  # Bias towards distribution
-                
-                sentiment = 'neutral'
-                if random_value > 0.3:
-                    sentiment = 'accumulation'
-                    accumulation_days += 1
-                elif random_value < -0.3:
-                    sentiment = 'distribution'
-                    distribution_days += 1
-                else:
-                    neutral_days += 1
-                
-                # Create daily stats
-                daily_stat = {
-                    'date': date.strftime('%Y-%m-%d'),
-                    'whale_transactions': random.randint(1, 10),
-                    'unique_whales': random.randint(5, 20),
-                    'net_flow': random_value,
-                    'sentiment': sentiment
+        # Configure the parameters based on token type
+        if token_symbol.lower() == "eth":
+            # For native ETH
+            params = {
+                "fromBlock": hex(from_block),
+                "toBlock": "latest",
+                "category": ["external"]
+            }
+        else:
+            # For ERC-20 tokens
+            token_contracts = self._get_token_contract(token_symbol)
+            if not token_contracts:
+                logger.warning(f"No contract address found for {token_symbol}")
+                return {
+                    "token": token_symbol,
+                    "whale_threshold_usd": usd_threshold,
+                    "whale_threshold_tokens": round(token_threshold, 6),
+                    "whale_count": 0,
+                    "whale_volume": 0,
+                    "total_volume": 0,
+                    "whale_volume_percent": 0,
+                    "buy_volume": 0,
+                    "sell_volume": 0,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "transactions": [],
+                    "timestamp": datetime.now().isoformat(),
+                    "is_mock_data": is_mock_data
                 }
                 
-                result['daily_stats'].append(daily_stat)
-            
-            # Determine overall trend
-            if accumulation_days > distribution_days and accumulation_days > neutral_days:
-                result['overall_trend'] = 'accumulation'
-            elif distribution_days > accumulation_days and distribution_days > neutral_days:
-                result['overall_trend'] = 'distribution'
-            else:
-                result['overall_trend'] = 'neutral'
-            
-            # Update result
-            result['accumulation_days'] = accumulation_days
-            result['distribution_days'] = distribution_days
-            result['neutral_days'] = neutral_days
-            
-            # Determine whale count trend
-            first_day_whales = result['daily_stats'][-1]['unique_whales']
-            last_day_whales = result['daily_stats'][0]['unique_whales']
-            
-            if last_day_whales > first_day_whales * 1.2:
-                result['whale_count_trend'] = 'increasing'
-            elif last_day_whales < first_day_whales * 0.8:
-                result['whale_count_trend'] = 'decreasing'
-            else:
-                result['whale_count_trend'] = 'stable'
+            params = {
+                "fromBlock": hex(from_block),
+                "toBlock": "latest",
+                "category": ["erc20"],
+                "contractAddresses": token_contracts
+            }
         
-        except Exception as e:
-            print(f"Error analyzing whale activity trend: {e}")
+        # Get transfers data
+        transfers = self.alchemy_client.get_asset_transfers(params)
         
-        return result 
+        # Process the transfers to identify whale transactions
+        whale_txs = []
+        total_volume = 0
+        whale_volume = 0
+        
+        for transfer in transfers.get("transfers", []):
+            # Extract addresses with proper checks
+            from_address = transfer.get("from", "")
+            to_address = transfer.get("to", "")
+            
+            # Safely convert value to float
+            try:
+                value = float(transfer.get("value", 0))
+            except (ValueError, TypeError):
+                logger.debug(f"Skipping transfer with invalid value: {transfer}")
+                continue
+            
+            # Skip if address is missing or value is zero/negative
+            if not from_address or not to_address or value <= 0:
+                logger.debug(f"Skipping transfer with missing address or zero/negative value")
+                continue
+                
+            total_volume += value
+            
+            # Check if this is a whale transaction
+            if value >= token_threshold:
+                whale_volume += value
+                
+                # Format the transaction data
+                whale_txs.append({
+                    "hash": transfer.get("hash", ""),
+                    "from": from_address,
+                    "to": to_address,
+                    "value": value,
+                    "usd_value": round(value * token_price, 2),
+                    "timestamp": transfer.get("metadata", {}).get("blockTimestamp", "")
+                })
+        
+        # Sort whale transactions by value (descending)
+        whale_txs.sort(key=lambda x: x["value"], reverse=True)
+        
+        # Calculate metrics
+        whale_count = len(whale_txs)
+        
+        # Initialize direction metrics
+        buy_volume = 0
+        sell_volume = 0
+        buy_count = 0
+        sell_count = 0
+        
+        # Simplified heuristic: transfers to exchanges are considered sells
+        from .exchange_flow import EXCHANGE_WALLETS
+        exchange_addresses = {addr.lower() for addr in EXCHANGE_WALLETS.keys()}
+        
+        for tx in whale_txs:
+            to_address = tx["to"].lower() if tx["to"] else ""
+            from_address = tx["from"].lower() if tx["from"] else ""
+            
+            if to_address in exchange_addresses:
+                # Treating as a sell (retail selling to exchanges)
+                sell_volume += tx["value"]
+                sell_count += 1
+            elif from_address in exchange_addresses:
+                # Treating as a buy (retail buying from exchanges)
+                buy_volume += tx["value"]
+                buy_count += 1
+            else:
+                # Wallet-to-wallet transfer
+                # Could be categorized further with more sophisticated analysis
+                pass
+        
+        # Compute whale metrics
+        result = {
+            "token": token_symbol,
+            "whale_threshold_usd": usd_threshold,
+            "whale_threshold_tokens": round(token_threshold, 6),
+            "whale_count": whale_count,
+            "whale_volume": round(whale_volume, 4),
+            "total_volume": round(total_volume, 4),
+            "whale_volume_percent": round(whale_volume / total_volume * 100 if total_volume > 0 else 0, 2),
+            "buy_volume": round(buy_volume, 4),
+            "sell_volume": round(sell_volume, 4),
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "transactions": whale_txs[:10],  # Limit to top 10 to avoid excessive data
+            "timestamp": datetime.now().isoformat(),
+            "is_mock_data": is_mock_data
+        }
+        
+        # Update cache
+        self.whale_txs_cache[cache_key] = result
+        self.cache_timestamp = current_time
+        
+        logger.debug(f"Completed whale transaction analysis for {token_symbol}")
+        return result
+    
+    def get_whale_signals(self, token_symbol: str, hours: int = 24) -> Dict[str, float]:
+        """
+        Generate trading signals based on whale activity
+        
+        Args:
+            token_symbol: Symbol of the token to analyze
+            hours: Number of hours to look back
+            
+        Returns:
+            Dict of signal values between -1.0 and 1.0
+        """
+        whale_data = self.track_whale_transactions(token_symbol, hours)
+        
+        # No data case
+        if whale_data["whale_count"] == 0:
+            return {
+                "whale_activity_signal": 0,
+                "whale_confidence": 0,
+                "whale_accumulation": 0
+            }
+        
+        # Calculate signals
+        
+        # 1. Whale activity signal: positive when buying exceeds selling
+        if whale_data["buy_volume"] + whale_data["sell_volume"] > 0:
+            if whale_data["buy_volume"] > whale_data["sell_volume"]:
+                # More buying than selling - bullish
+                whale_activity_signal = min(1.0, (whale_data["buy_volume"] - whale_data["sell_volume"]) / 
+                                         (whale_data["buy_volume"] + whale_data["sell_volume"]) * 2)
+            else:
+                # More selling than buying - bearish
+                whale_activity_signal = max(-1.0, (whale_data["buy_volume"] - whale_data["sell_volume"]) / 
+                                          (whale_data["buy_volume"] + whale_data["sell_volume"]) * 2)
+        else:
+            whale_activity_signal = 0
+        
+        # 2. Whale confidence: higher when whale volume dominates total volume
+        whale_confidence = min(1.0, whale_data["whale_volume_percent"] / 50)
+        
+        # 3. Whale accumulation: are whales cumulatively buying or selling?
+        if whale_data["buy_count"] + whale_data["sell_count"] > 0:
+            whale_accumulation = (whale_data["buy_count"] - whale_data["sell_count"]) / (whale_data["buy_count"] + whale_data["sell_count"])
+        else:
+            whale_accumulation = 0
+        
+        return {
+            "whale_activity_signal": round(whale_activity_signal, 2),
+            "whale_confidence": round(whale_confidence, 2),
+            "whale_accumulation": round(whale_accumulation, 2)
+        }
+    
+    def _get_token_contract(self, token_symbol: str) -> List[str]:
+        """
+        Get the contract address for a token symbol
+        
+        Args:
+            token_symbol: Token symbol (e.g., 'ETH', 'BTC')
+            
+        Returns:
+            List of contract addresses
+        """
+        # Common token contracts - same as in ExchangeFlowAnalyzer
+        token_contracts = {
+            "btc": ["0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"],  # WBTC
+            "eth": [], # Native ETH
+            "usdt": ["0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+            "usdc": ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
+            "link": ["0x514910771AF9Ca656af840dff83E8264EcF986CA"],
+            "uni": ["0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"],
+            "aave": ["0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"],
+        }
+        
+        return token_contracts.get(token_symbol.lower(), []) 
