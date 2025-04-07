@@ -39,6 +39,10 @@ class AlchemyClient:
         
         # Use the HTTP endpoint URL
         self.base_url = f"https://eth-mainnet.g.alchemy.com/v2/{self.api_key}"
+        
+        # Prices API endpoint
+        self.prices_base_url = f"https://api.g.alchemy.com/prices/v1/{self.api_key}"
+        
         logger.info("Alchemy API client initialized")
     
     def _make_request(self, method: str, params: List = None) -> Dict:
@@ -447,4 +451,179 @@ class AlchemyClient:
         except Exception as e:
             logger.error(f"Error getting gas price: {str(e)}")
             # Return realistic fallback value (30 Gwei in wei)
-            return 30 * 1_000_000_000 
+            return 30 * 1_000_000_000
+            
+    # ----------------------- Prices API Methods -----------------------
+    
+    def get_token_price_by_symbol(self, symbols: List[str]) -> Dict:
+        """
+        Get current token prices by symbol using Alchemy's Prices API
+        
+        Args:
+            symbols: List of token symbols (e.g., ["ETH", "BTC", "USDT"])
+            
+        Returns:
+            Dictionary with token prices
+        """
+        if not symbols:
+            logger.warning("No symbols provided to get_token_price_by_symbol")
+            return {"data": []}
+            
+        try:
+            # Construct URL with query parameters
+            url = f"{self.prices_base_url}/tokens/by-symbol"
+            
+            # Add symbols as query parameters
+            params = []
+            for symbol in symbols:
+                params.append(("symbols", symbol))
+                
+            # Make the request
+            logger.debug(f"Making Alchemy Prices API request for symbols: {symbols}")
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            logger.debug(f"Received price data for {len(data.get('data', []))} symbols")
+            
+            return data
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error when getting token prices by symbol: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error when getting token prices by symbol: {str(e)}")
+            raise
+    
+    def get_token_price_by_address(self, addresses: List[Dict]) -> Dict:
+        """
+        Get current token prices by contract address using Alchemy's Prices API
+        
+        Args:
+            addresses: List of dictionaries with network and address keys
+                      (e.g., [{"network": "eth-mainnet", "address": "0x..."}])
+            
+        Returns:
+            Dictionary with token prices
+        """
+        if not addresses:
+            logger.warning("No addresses provided to get_token_price_by_address")
+            return {"data": []}
+            
+        try:
+            # Construct URL
+            url = f"{self.prices_base_url}/tokens/by-address"
+            
+            # Create request payload
+            payload = {"addresses": addresses}
+            
+            # Make the request
+            logger.debug(f"Making Alchemy Prices API request for addresses: {addresses}")
+            response = requests.post(
+                url, 
+                headers={"Content-Type": "application/json"},
+                json=payload
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            logger.debug(f"Received price data for {len(data.get('data', []))} addresses")
+            
+            return data
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error when getting token prices by address: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error when getting token prices by address: {str(e)}")
+            raise
+    
+    def get_historical_token_prices(self, 
+                                  symbol_or_address: str, 
+                                  network: str = "eth-mainnet",
+                                  is_address: bool = False,
+                                  start_timestamp: int = None, 
+                                  end_timestamp: int = None,
+                                  interval: str = "1d") -> Dict:
+        """
+        Get historical token prices using Alchemy's Prices API
+        
+        Args:
+            symbol_or_address: Token symbol or contract address
+            network: Blockchain network (only used if is_address is True)
+            is_address: Whether symbol_or_address is a contract address
+            start_timestamp: Start timestamp in UNIX seconds (defaults to 30 days ago)
+            end_timestamp: End timestamp in UNIX seconds (defaults to current time)
+            interval: Time interval ("1h", "1d", etc.)
+            
+        Returns:
+            Dictionary with historical price data
+        """
+        if not symbol_or_address:
+            logger.warning("No symbol or address provided to get_historical_token_prices")
+            return {"data": []}
+            
+        try:
+            # Set default timestamps if not provided
+            current_time = int(time.time())
+            if not end_timestamp:
+                end_timestamp = current_time
+            if not start_timestamp:
+                # Default to 30 days before end_timestamp
+                start_timestamp = end_timestamp - (30 * 24 * 60 * 60)
+                
+            # Construct URL
+            if is_address:
+                url = f"{self.prices_base_url}/tokens/{network}/{symbol_or_address}/history"
+            else:
+                url = f"{self.prices_base_url}/tokens/symbol/{symbol_or_address}/history"
+                
+            # Add query parameters
+            params = {
+                "from": start_timestamp,
+                "to": end_timestamp,
+                "interval": interval
+            }
+                
+            # Make the request
+            logger.debug(f"Making Alchemy Prices API request for historical data: {symbol_or_address}")
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            logger.debug(f"Received historical price data for {symbol_or_address}")
+            
+            return data
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error when getting historical token prices: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error when getting historical token prices: {str(e)}")
+            raise
+    
+    def get_current_crypto_price(self, symbol: str) -> float:
+        """
+        Get the current price of a cryptocurrency in USD
+        
+        Args:
+            symbol: Cryptocurrency symbol (e.g., "ETH", "BTC")
+            
+        Returns:
+            Current price in USD
+        """
+        try:
+            # Get price data from Alchemy
+            price_data = self.get_token_price_by_symbol([symbol])
+            
+            # Extract price from response
+            if "data" in price_data and price_data["data"]:
+                for token_data in price_data["data"]:
+                    if token_data["symbol"].upper() == symbol.upper():
+                        if "prices" in token_data and token_data["prices"]:
+                            for price_info in token_data["prices"]:
+                                if price_info["currency"] == "USD":
+                                    return float(price_info["value"])
+            
+            logger.warning(f"Price not found for {symbol}, returning None")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting current crypto price for {symbol}: {str(e)}")
+            return None 

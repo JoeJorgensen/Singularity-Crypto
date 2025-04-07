@@ -2,34 +2,33 @@
 Core trading strategy for cryptocurrency trading.
 Implements the main trading logic and signal processing.
 """
-from typing import Dict, List, Optional, Union, Tuple
 from datetime import datetime, timedelta
-import time
 import json
 import logging
-import asyncio
-import aiohttp
-import threading
-from functools import lru_cache
 import os
+import threading
+import time
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple, Union
 
-import pandas as pd
+import aiohttp
+import asyncio
 import numpy as np
+import pandas as pd
 
 # Import APIs and utilities
 from api.alpaca_api import AlpacaAPI
+from api.coinlore_api import CoinloreAPI
 from api.finnhub_api import FinnhubAPI
 from api.openai_api import OpenAIAPI
-from api.coinlore_api import CoinloreAPI
 from technical.indicators import TechnicalIndicators
 from technical.signal_generator import SignalGenerator
-from utils.risk_manager import RiskManager
-from utils.position_calculator import PositionCalculator
-from utils.order_manager import OrderManager
 from utils.logging_config import get_logger
+from utils.order_manager import OrderManager
+from utils.position_calculator import PositionCalculator
+from utils.risk_manager import RiskManager
 
-# Configure logging
-from utils.logging_config import setup_logging
+# Get logger
 logger = get_logger('trading_strategy')
 
 class TradingStrategy:
@@ -462,17 +461,11 @@ class TradingStrategy:
                 self.config.get('technical_indicators', {})
             )
             
-            # Calculate trend signal
-            trend_signal = self.calculate_trend_signal(data)
-            
-            # Calculate momentum signal
-            momentum_signal = self.calculate_momentum_signal(data)
-            
-            # Calculate volatility signal
-            volatility_signal = self.calculate_volatility_signal(data)
-            
-            # Calculate volume signal
-            volume_signal = self.calculate_volume_signal(data)
+            # Use the SignalGenerator to get all component signals
+            trend_signal = self.signal_generator.generate_trend_signal(data)
+            momentum_signal = self.signal_generator.generate_momentum_signal(data)
+            volatility_signal = self.signal_generator.generate_volatility_signal(data)
+            volume_signal = self.signal_generator.generate_volume_signal(data)
             
             # Log component signals
             logger.info(f"Component signals: trend={trend_signal:.4f}, momentum={momentum_signal:.4f}, volatility={volatility_signal:.4f}, volume={volume_signal:.4f}")
@@ -1335,10 +1328,7 @@ class TradingStrategy:
     
     def calculate_dynamic_ttl(self, market_data: pd.DataFrame) -> int:
         """
-        Calculate a dynamic TTL for sentiment data based on market conditions.
-        
-        During high volatility periods, we want a shorter TTL to update more frequently.
-        During stable market conditions, we can use a longer TTL.
+        Calculate dynamic TTL (time-to-live) for cache data based on market volatility.
         
         Args:
             market_data: DataFrame with market data
@@ -1346,458 +1336,83 @@ class TradingStrategy:
         Returns:
             TTL in seconds
         """
-        # Extract symbol from market data if available, otherwise use default
-        symbol = market_data['symbol'].iloc[0] if 'symbol' in market_data.columns else self.default_pair
+        # Base TTL from config
+        base_ttl = self.config.get('data_optimization', {}).get('cache_ttl', 60)  # seconds
         
         try:
-            # Calculate a simple volatility measure (standard deviation of returns)
-            if len(market_data) >= 10:
-                returns = market_data['close'].pct_change().dropna()
-                volatility = returns.std()
+            # Calculate recent volatility (standard deviation of returns)
+            if len(market_data) > 10:
+                recent_returns = market_data['close'].pct_change().dropna().tail(10)
+                volatility = recent_returns.std()
                 
-                # Update tracked volatility for this symbol
-                self.market_volatility[symbol] = volatility
-                
-                # Base TTL from config
-                base_ttl = self.config.get('data_optimization', {}).get('cache_ttl', 60)
-                
-                # In highly volatile markets (volatility > 0.01 or 1%), reduce TTL
-                if volatility > 0.01:
-                    # Inverse relationship: higher volatility -> lower TTL
-                    # Minimum TTL is 30 seconds
-                    ttl = max(30, int(base_ttl * (0.01 / volatility)))
-                    logger.info(f"High market volatility ({volatility:.4f}), setting shorter sentiment TTL: {ttl}s")
-                    return ttl
-                else:
-                    # In stable markets, use a longer TTL (up to 3x base)
-                    ttl = min(base_ttl * 3, int(base_ttl * (0.01 / max(0.001, volatility))))
-                    logger.info(f"Stable market ({volatility:.4f}), setting longer sentiment TTL: {ttl}s")
-                    return ttl
+                # Scale TTL inversely with volatility
+                # Higher volatility = lower TTL
+                if volatility > 0:
+                    # Default max_volatility is 0.03 (3% std dev per bar)
+                    max_volatility = self.config.get('data_optimization', {}).get('max_volatility', 0.03)
+                    min_ttl_factor = self.config.get('data_optimization', {}).get('min_ttl_factor', 0.2)
+                    
+                    # Calculate TTL factor between min_ttl_factor and 1.0
+                    ttl_factor = max(min_ttl_factor, 1.0 - (volatility / max_volatility))
+                    
+                    # Apply TTL factor
+                    adjusted_ttl = int(base_ttl * ttl_factor)
+                    
+                    # Log the adjustment
+                    logger.debug(f"Dynamic TTL adjusted based on volatility {volatility:.4f}: {adjusted_ttl}s (base: {base_ttl}s)")
+                    
+                    return adjusted_ttl
         except Exception as e:
-            logger.error(f"Error calculating dynamic TTL: {str(e)}")
+            logger.debug(f"Error calculating dynamic TTL, using base value: {str(e)}")
         
-        # Default TTL (3x base TTL) if calculation fails
-        return self.config.get('data_optimization', {}).get('cache_ttl', 60) * 3
-    
-    def calculate_trend_signal(self, data: pd.DataFrame) -> float:
-        """
-        Calculate trend signal from price data.
+        return base_ttl
         
-        Args:
-            data: DataFrame with price and indicator data
-            
-        Returns:
-            Signal value between -1 and 1 (positive = bullish)
-        """
-        try:
-            # Default signal if no indicators available
-            if data.empty:
-                return 0
-                
-            signal = 0
-            count = 0
-            
-            # Check for EMA crossovers (EMA20 vs EMA50)
-            if 'ema_20' in data.columns and 'ema_50' in data.columns:
-                # Get the most recent values
-                ema_20 = data['ema_20'].iloc[-1]
-                ema_50 = data['ema_50'].iloc[-1]
-                
-                # Previous values (to check for crossovers)
-                prev_ema_20 = data['ema_20'].iloc[-2] if len(data) > 2 else ema_20
-                prev_ema_50 = data['ema_50'].iloc[-2] if len(data) > 2 else ema_50
-                
-                # Current relation
-                if ema_20 > ema_50:
-                    # Bullish trend
-                    signal += 0.3
-                    
-                    # Check for recent crossover (stronger signal)
-                    if prev_ema_20 <= prev_ema_50:
-                        signal += 0.2  # Recent bullish crossover
-                else:
-                    # Bearish trend
-                    signal -= 0.3
-                    
-                    # Check for recent crossover (stronger signal)
-                    if prev_ema_20 >= prev_ema_50:
-                        signal -= 0.2  # Recent bearish crossover
-                        
-                count += 1
-            
-            # Check price relative to moving averages
-            if 'close' in data.columns and 'sma_50' in data.columns:
-                current_price = data['close'].iloc[-1]
-                sma_50 = data['sma_50'].iloc[-1]
-                
-                # Price above/below SMA50
-                if current_price > sma_50:
-                    signal += 0.2
-                else:
-                    signal -= 0.2
-                    
-                count += 1
-            
-            # Add Bollinger Bands signal
-            if 'close' in data.columns and 'bb_upper' in data.columns and 'bb_lower' in data.columns:
-                current_price = data['close'].iloc[-1]
-                bb_upper = data['bb_upper'].iloc[-1]
-                bb_lower = data['bb_lower'].iloc[-1]
-                bb_middle = data['bb_middle'].iloc[-1] if 'bb_middle' in data.columns else None
-                
-                # Calculate distance from bands
-                band_width = bb_upper - bb_lower
-                if band_width > 0:
-                    # Normalize position within bands (-1 to +1)
-                    if bb_middle is not None:
-                        # Use position relative to middle band
-                        band_position = (current_price - bb_middle) / (band_width / 2)
-                        # Cap at -1 to +1
-                        band_position = max(-1, min(1, band_position))
-                        signal += band_position * 0.2
-                    else:
-                        # Fallback to simple band position
-                        if current_price > bb_upper:
-                            signal += 0.3  # Overbought
-                        elif current_price < bb_lower:
-                            signal -= 0.3  # Oversold
-                count += 1
-            
-            # Normalize signal by count of indicators used
-            if count > 0:
-                normalized_signal = signal / count
-                # Cap at -1 to +1
-                return max(-1, min(1, normalized_signal))
-            else:
-                return 0
-                
-        except Exception as e:
-            logger.error(f"Error calculating trend signal: {str(e)}")
-            return 0
-    
-    def calculate_momentum_signal(self, data: pd.DataFrame) -> float:
-        """
-        Calculate momentum signal from price data.
-        
-        Args:
-            data: DataFrame with price and indicator data
-            
-        Returns:
-            Signal value between -1 and 1 (positive = bullish momentum)
-        """
-        try:
-            # Default signal if no indicators available
-            if data.empty:
-                return 0
-                
-            signal = 0
-            count = 0
-            
-            # RSI signal
-            if 'rsi' in data.columns:
-                rsi = data['rsi'].iloc[-1]
-                
-                # Convert RSI to a -1 to +1 signal
-                # RSI 70+ = overbought (-0.5)
-                # RSI 30- = oversold (+0.5)
-                # RSI 50 = neutral (0)
-                if rsi >= 70:
-                    signal -= 0.5  # Overbought
-                elif rsi <= 30:
-                    signal += 0.5  # Oversold
-                else:
-                    # Linear interpolation between 30-70
-                    signal += (50 - rsi) / 40  # -0.5 to +0.5
-                
-                count += 1
-            
-            # MACD signal
-            if 'macd' in data.columns and 'macd_signal' in data.columns:
-                macd = data['macd'].iloc[-1]
-                macd_signal = data['macd_signal'].iloc[-1]
-                
-                # MACD crossing above signal line = bullish
-                # MACD crossing below signal line = bearish
-                if macd > macd_signal:
-                    signal += 0.3
-                    
-                    # Check for recent crossover
-                    if len(data) > 2 and data['macd'].iloc[-2] <= data['macd_signal'].iloc[-2]:
-                        signal += 0.2  # Recent bullish crossover
-                else:
-                    signal -= 0.3
-                    
-                    # Check for recent crossover
-                    if len(data) > 2 and data['macd'].iloc[-2] >= data['macd_signal'].iloc[-2]:
-                        signal -= 0.2  # Recent bearish crossover
-                
-                count += 1
-            
-            # Stochastic oscillator
-            if 'stoch_k' in data.columns and 'stoch_d' in data.columns:
-                k = data['stoch_k'].iloc[-1]
-                d = data['stoch_d'].iloc[-1]
-                
-                # Overbought/oversold
-                if k > 80 and d > 80:
-                    signal -= 0.4  # Overbought
-                elif k < 20 and d < 20:
-                    signal += 0.4  # Oversold
-                
-                # Crossover signal
-                if k > d:
-                    signal += 0.2
-                    
-                    # Recent crossover check
-                    if len(data) > 2 and data['stoch_k'].iloc[-2] <= data['stoch_d'].iloc[-2]:
-                        signal += 0.2  # Recent bullish crossover
-                else:
-                    signal -= 0.2
-                    
-                    # Recent crossover check
-                    if len(data) > 2 and data['stoch_k'].iloc[-2] >= data['stoch_d'].iloc[-2]:
-                        signal -= 0.2  # Recent bearish crossover
-                
-                count += 1
-            
-            # Normalize signal by count of indicators used
-            if count > 0:
-                normalized_signal = signal / count
-                # Cap at -1 to +1
-                return max(-1, min(1, normalized_signal))
-            else:
-                return 0
-                
-        except Exception as e:
-            logger.error(f"Error calculating momentum signal: {str(e)}")
-            return 0
-    
-    def calculate_volatility_signal(self, data: pd.DataFrame) -> float:
-        """
-        Calculate volatility signal from price data.
-        Used primarily for risk assessment rather than direction.
-        
-        Args:
-            data: DataFrame with price and indicator data
-            
-        Returns:
-            Signal value between -1 and 1 (higher absolute value = higher volatility)
-        """
-        try:
-            # Default signal if no indicators available
-            if data.empty:
-                return 0
-                
-            # Calculate historical volatility
-            if 'close' in data.columns and len(data) > 5:
-                # Calculate returns
-                returns = data['close'].pct_change().dropna()
-                
-                # Calculate rolling standard deviation (volatility)
-                volatility = returns.rolling(window=14).std().iloc[-1] if len(returns) >= 14 else returns.std()
-                
-                # Annualized volatility
-                annualized_volatility = volatility * (252 ** 0.5)  # 252 trading days 
-                
-                # Convert to signal (-1 to +1)
-                # For volatility, we use 0 to represent normal volatility
-                # Negative values indicate unusually low volatility (coiling for a move)
-                # Positive values indicate unusually high volatility (potential reversals)
-                
-                # Baseline volatility for crypto (adjust as needed)
-                baseline_volatility = 0.6  # 60% annual volatility as baseline
-                
-                if annualized_volatility < baseline_volatility * 0.5:
-                    # Unusually low volatility - potential for breakout
-                    return -0.5
-                elif annualized_volatility > baseline_volatility * 2:
-                    # Unusually high volatility - potential for reversal
-                    return 0.5
-                else:
-                    # Normal volatility range - scale between -0.3 and +0.3
-                    normalized = ((annualized_volatility / baseline_volatility) - 1) * 0.3
-                    return max(-0.3, min(0.3, normalized))
-            
-            # ATR can also be used if present
-            if 'atr' in data.columns and 'close' in data.columns:
-                # Calculate ATR as percentage of price
-                atr_pct = data['atr'].iloc[-1] / data['close'].iloc[-1] * 100  # ATR as percentage of price
-                
-                # Baseline ATR percentage for crypto
-                baseline_atr_pct = 3.0  # 3% daily ATR as baseline
-                
-                if atr_pct < baseline_atr_pct * 0.5:
-                    # Unusually low volatility
-                    return -0.5
-                elif atr_pct > baseline_atr_pct * 2:
-                    # Unusually high volatility
-                    return 0.5
-                else:
-                    # Normal volatility range
-                    normalized = ((atr_pct / baseline_atr_pct) - 1) * 0.3
-                    return max(-0.3, min(0.3, normalized))
-            
-            # If no volatility indicators available
-            return 0
-                
-        except Exception as e:
-            logger.error(f"Error calculating volatility signal: {str(e)}")
-            return 0
-    
-    def calculate_volume_signal(self, data: pd.DataFrame) -> float:
-        """
-        Calculate volume signal from price data.
-        
-        Args:
-            data: DataFrame with price and indicator data
-            
-        Returns:
-            Signal value between -1 and 1 (positive = bullish volume)
-        """
-        try:
-            # Default signal if no indicators available
-            if data.empty:
-                return 0
-                
-            signal = 0
-            count = 0
-            
-            # Volume change
-            if 'volume' in data.columns and len(data) > 20:
-                # Get current volume
-                current_volume = data['volume'].iloc[-1]
-                
-                # Calculate average volume (20 periods)
-                avg_volume = data['volume'].iloc[-20:].mean()
-                
-                # Check if volume is significantly higher/lower than average
-                if current_volume > 0 and avg_volume > 0:
-                    volume_ratio = current_volume / avg_volume
-                    
-                    # Volume significantly higher than average
-                    if volume_ratio > 2.0:
-                        # High volume - direction depends on price movement
-                        price_change = data['close'].iloc[-1] - data['close'].iloc[-2]
-                        
-                        if price_change > 0:
-                            signal += 0.7  # Strong bullish signal
-                        else:
-                            signal -= 0.7  # Strong bearish signal
-                    elif volume_ratio > 1.5:
-                        # Moderately high volume
-                        price_change = data['close'].iloc[-1] - data['close'].iloc[-2]
-                        
-                        if price_change > 0:
-                            signal += 0.4  # Moderate bullish signal
-                        else:
-                            signal -= 0.4  # Moderate bearish signal
-                    elif volume_ratio < 0.5:
-                        # Very low volume
-                        signal += 0.1  # Slight bullish bias (low volume pullbacks)
-                
-                count += 1
-            
-            # On-Balance Volume (OBV) trend
-            if 'obv' in data.columns and len(data) > 20:
-                # Calculate short-term OBV trend (5 periods)
-                short_obv_trend = data['obv'].iloc[-1] - data['obv'].iloc[-5]
-                
-                # Calculate longer-term OBV trend (20 periods)
-                long_obv_trend = data['obv'].iloc[-1] - data['obv'].iloc[-20]
-                
-                # Check for OBV divergence with price
-                price_change_5 = data['close'].iloc[-1] - data['close'].iloc[-5]
-                price_change_20 = data['close'].iloc[-1] - data['close'].iloc[-20]
-                
-                # Short-term OBV trend
-                if short_obv_trend > 0:
-                    signal += 0.3  # Bullish OBV
-                else:
-                    signal -= 0.3  # Bearish OBV
-                
-                # OBV divergence (bullish)
-                if price_change_20 < 0 and long_obv_trend > 0:
-                    signal += 0.5  # Bullish divergence
-                
-                # OBV divergence (bearish)
-                if price_change_20 > 0 and long_obv_trend < 0:
-                    signal -= 0.5  # Bearish divergence
-                
-                count += 1
-            
-            # Volume-weighted MACD if available
-            if 'volume_weighted_macd' in data.columns and 'volume_weighted_macd_signal' in data.columns:
-                vw_macd = data['volume_weighted_macd'].iloc[-1]
-                vw_macd_signal = data['volume_weighted_macd_signal'].iloc[-1]
-                
-                if vw_macd > vw_macd_signal:
-                    signal += 0.4
-                    
-                    # Check for recent crossover
-                    if len(data) > 2 and data['volume_weighted_macd'].iloc[-2] <= data['volume_weighted_macd_signal'].iloc[-2]:
-                        signal += 0.3  # Recent bullish crossover with volume confirmation
-                else:
-                    signal -= 0.4
-                    
-                    # Check for recent crossover
-                    if len(data) > 2 and data['volume_weighted_macd'].iloc[-2] >= data['volume_weighted_macd_signal'].iloc[-2]:
-                        signal -= 0.3  # Recent bearish crossover with volume confirmation
-                
-                count += 1
-            
-            # Normalize signal by count of indicators used
-            if count > 0:
-                normalized_signal = signal / count
-                # Cap at -1 to +1
-                return max(-1, min(1, normalized_signal))
-            else:
-                return 0
-                
-        except Exception as e:
-            logger.error(f"Error calculating volume signal: {str(e)}")
-            return 0
-    
     def _initialize_websocket(self):
-        """Initialize the websocket connection for real-time ETH/USD market data"""
+        """
+        Initialize and start websocket connection for real-time data.
+        Separated to avoid redundant initializations.
+        """
+        alpaca_api = self.apis['alpaca']
+        
+        # Only monitor ETH/USD
+        symbols_to_monitor = ['ETH/USD']
+        
         try:
-            # Check if websocket has already been initialized
-            if hasattr(self, 'ws_initialization_attempted') and self.ws_initialization_attempted:
-                self.logger.info("Websocket initialization already attempted, skipping redundant initialization")
-                return
-            
-            # Mark as attempted
-            self.ws_initialization_attempted = True
-            
-            self.logger.info("Initializing websocket for ETH/USD")
-            
-            # Only use ETH/USD
-            symbol = 'ETH/USD'
-            
-            websocket_started = self.apis['alpaca'].start_websocket(
-                symbols=[symbol], 
-                timeout=5.0,
+            logger.info("Starting websocket connection for ETH/USD")
+            # Start with a short timeout for initial connection
+            result = alpaca_api.start_websocket(
+                symbols=symbols_to_monitor,
+                timeout=5.0, 
                 non_blocking=True
             )
             
-            if websocket_started:
-                self.logger.info("Websocket initialized successfully for ETH/USD")
+            if result:
+                logger.info("Websocket connection started successfully for ETH/USD")
             else:
-                self.logger.warning("Failed to initialize websocket for ETH/USD. Will use REST API.")
+                logger.warning("Websocket connection failed to start for ETH/USD, using REST API polling as fallback")
         except Exception as e:
-            self.logger.error(f"Error initializing websocket: {e}")
-            self.logger.warning("Will use REST API for market data.")
-    
-    def cleanup(self):
-        """Cleanup resources like websocket connections"""
+            logger.error(f"Error starting websocket: {str(e)}")
+            logger.info("Continuing with REST API polling as fallback")
+        
+        # Start the price cache updater to maintain price data
         try:
-            # Stop the websocket connection if it exists
-            if hasattr(self.apis['alpaca'], 'stop_websocket'):
-                self.logger.info("Stopping websocket connection")
-                self.apis['alpaca'].stop_websocket()
-                
-            # Stop the price cache updater if it exists
-            if hasattr(self.apis['alpaca'], 'stop_price_cache_updater'):
-                self.logger.info("Stopping price cache updater")
-                self.apis['alpaca'].stop_price_cache_updater()
+            logger.info("Starting price cache updater for ETH/USD")
+            alpaca_api.start_price_cache_updater(symbols=symbols_to_monitor)
+            logger.info("Price cache updater started successfully")
         except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
+            logger.warning(f"Error starting price cache updater: {str(e)}")
+            
+    def cleanup(self):
+        """
+        Clean up resources when shutting down the trading strategy.
+        """
+        logger.info("Cleaning up trading strategy resources")
+        try:
+            # Stop websocket connection if it exists
+            if self.apis.get('alpaca'):
+                self.apis['alpaca'].stop_websocket()
+                self.apis['alpaca'].stop_price_cache_updater()
+                
+            logger.info("Trading strategy cleanup completed")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")

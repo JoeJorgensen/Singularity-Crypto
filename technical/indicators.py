@@ -3,10 +3,14 @@ Technical indicators for cryptocurrency trading.
 Implements various technical indicators such as RSI, MACD, EMA, etc.
 """
 from typing import Dict, List, Optional, Union
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import pandas_ta as ta
-import logging
+from utils.logging_config import get_logger
+
+# Get logger
+logger = get_logger('CryptoTrader.technical.indicators')
 
 class TechnicalIndicators:
     """
@@ -298,19 +302,22 @@ class TechnicalIndicators:
         Returns:
             DataFrame with volume indicator columns added
         """
-        logger = logging.getLogger('CryptoTrader.technical.indicators')
-        
         logger.debug(f"Adding volume indicators to DataFrame with shape {df.shape}")
+        
+        # Ensure the dataframe is sorted properly by timestamp
+        if hasattr(df.index, 'is_monotonic_increasing') and not df.index.is_monotonic_increasing:
+            logger.warning("DataFrame index is not sorted. Sorting by index.")
+            df = df.sort_index()
         
         if 'volume' not in df.columns:
             logger.warning("Cannot add volume indicators: 'volume' column missing from DataFrame")
-            # Add a default volume column with 0 values
-            df['volume'] = 0.0
-            # Add placeholder zero values for volume indicators
+            # Add a default volume column with non-zero values
+            df['volume'] = 1000.0
+            # Add placeholder values for volume indicators
             df['obv'] = 0.0
-            df['vwap'] = df['close'] if 'close' in df.columns else 0.0
+            df['vwap'] = df['close'] if 'close' in df.columns else 1000.0
             df['mfi'] = 50.0  # Neutral value
-            df['volume_sma20'] = 0.0
+            df['volume_sma20'] = 1000.0
             df['volume_osc'] = 0.0
             logger.info("Added placeholder volume indicators with neutral values")
             return df
@@ -320,6 +327,11 @@ class TechnicalIndicators:
             return df
             
         try:
+            # Check for zero volumes which can cause problems
+            if (df['volume'] == 0).all():
+                logger.warning("All volume values are zero. Setting to a minimal non-zero value.")
+                df['volume'] = 1000.0  # Use a constant non-zero value
+            
             # On-Balance Volume (OBV)
             df['obv'] = ta.obv(df['close'], df['volume'])
             logger.debug(f"Added OBV indicator, values: min={df['obv'].min()}, max={df['obv'].max()}, last={df['obv'].iloc[-1]}")
@@ -327,45 +339,63 @@ class TechnicalIndicators:
             # Volume Weighted Average Price (VWAP)
             if all(col in df.columns for col in ['high', 'low', 'close', 'volume']):
                 # Create a copy of the dataframe with a naive datetime index to avoid timezone warnings
-                df_naive = df.copy()
-                if hasattr(df_naive.index, 'tz') and df_naive.index.tz is not None:
-                    df_naive.index = df_naive.index.tz_localize(None)
-                
-                # Calculate VWAP on the naive timestamp dataframe
-                df['vwap'] = ta.vwap(
-                    high=df_naive['high'],
-                    low=df_naive['low'],
-                    close=df_naive['close'],
-                    volume=df_naive['volume']
-                )
-                logger.debug(f"Added VWAP indicator, values: min={df['vwap'].min()}, max={df['vwap'].max()}, last={df['vwap'].iloc[-1]}")
+                try:
+                    df_naive = df.copy()
+                    if hasattr(df_naive.index, 'tz') and df_naive.index.tz is not None:
+                        df_naive.index = df_naive.index.tz_localize(None)
+                    
+                    # Calculate VWAP on the naive timestamp dataframe
+                    df['vwap'] = ta.vwap(
+                        high=df_naive['high'],
+                        low=df_naive['low'],
+                        close=df_naive['close'],
+                        volume=df_naive['volume']
+                    )
+                    logger.debug(f"Added VWAP indicator, values: min={df['vwap'].min()}, max={df['vwap'].max()}, last={df['vwap'].iloc[-1]}")
+                except Exception as vwap_error:
+                    logger.warning(f"Error calculating VWAP: {str(vwap_error)}")
+                    df['vwap'] = df['close']  # Use close price as a fallback
             else:
                 logger.warning("Missing required columns for VWAP calculation")
+                df['vwap'] = df['close']  # Use close price as a fallback
             
             # Money Flow Index (MFI)
             if len(df) >= 14 and all(col in df.columns for col in ['high', 'low', 'close', 'volume']):
-                df['mfi'] = ta.mfi(
-                    high=df['high'],
-                    low=df['low'],
-                    close=df['close'],
-                    volume=df['volume'],
-                    length=14
-                )
-                logger.debug(f"Added MFI indicator, values: min={df['mfi'].min()}, max={df['mfi'].max()}, last={df['mfi'].iloc[-1]}")
+                try:
+                    df['mfi'] = ta.mfi(
+                        high=df['high'],
+                        low=df['low'],
+                        close=df['close'],
+                        volume=df['volume'],
+                        length=14
+                    )
+                    logger.debug(f"Added MFI indicator, values: min={df['mfi'].min()}, max={df['mfi'].max()}, last={df['mfi'].iloc[-1]}")
+                except Exception as mfi_error:
+                    logger.warning(f"Error calculating MFI: {str(mfi_error)}")
+                    df['mfi'] = 50.0  # Neutral value as fallback
             else:
                 logger.warning(f"Cannot add MFI: insufficient data (length: {len(df)}) or missing columns")
+                df['mfi'] = 50.0  # Neutral value as fallback
             
             # Volume SMA - add simple moving average of volume for reference
             if len(df) >= 20:
                 df['volume_sma20'] = df['volume'].rolling(window=20).mean()
+                # Fill NaN values with the actual volume
+                df['volume_sma20'] = df['volume_sma20'].fillna(df['volume'])
                 logger.debug(f"Added Volume SMA(20), last value: {df['volume_sma20'].iloc[-1]}")
+            else:
+                df['volume_sma20'] = df['volume']
+                logger.warning(f"Cannot calculate volume_sma20: insufficient data (length: {len(df)})")
             
             # Volume oscillator (percentage difference between fast and slow volume MAs)
             if len(df) >= 20:
-                vol_fast = df['volume'].rolling(window=5).mean()
-                vol_slow = df['volume'].rolling(window=20).mean()
-                df['volume_osc'] = 100 * (vol_fast - vol_slow) / vol_slow
+                vol_fast = df['volume'].rolling(window=5).mean().fillna(df['volume'])
+                vol_slow = df['volume'].rolling(window=20).mean().fillna(df['volume'])
+                df['volume_osc'] = 100 * (vol_fast - vol_slow) / vol_slow.replace(0, 1)  # Avoid division by zero
                 logger.debug(f"Added Volume Oscillator, last value: {df['volume_osc'].iloc[-1]}")
+            else:
+                df['volume_osc'] = 0.0
+                logger.warning(f"Cannot calculate volume_osc: insufficient data (length: {len(df)})")
                 
             logger.debug(f"Successfully added volume indicators to DataFrame")
             return df
@@ -376,12 +406,19 @@ class TechnicalIndicators:
             logger.info("Added placeholder volume indicators with neutral values")
             for indicator in ['obv', 'vwap', 'mfi', 'volume_sma20', 'volume_osc']:
                 if indicator not in df.columns:
-                    # Explicitly cast to float64 to avoid FutureWarning about dtype incompatibility
-                    df[indicator] = float(0 if indicator != 'mfi' else 50)
+                    # Use consistent value for indicators
+                    if indicator == 'vwap':
+                        df[indicator] = df['close']
+                    elif indicator == 'mfi':
+                        df[indicator] = 50.0
+                    elif indicator == 'volume_sma20':
+                        df[indicator] = df['volume']
+                    else:
+                        df[indicator] = 0.0
             
             # Add 'volume' column if it doesn't exist (helps prevent further errors)
             if 'volume' not in df.columns:
-                df['volume'] = 0.0
+                df['volume'] = 1000.0
                 
             return df
     

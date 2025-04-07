@@ -1,6 +1,6 @@
 """
 Centralized logging configuration for CryptoTrader application.
-Provides a consistent logging setup with terminal-only output.
+Provides a consistent logging setup with terminal and file output.
 """
 import logging
 import sys
@@ -8,19 +8,35 @@ from typing import Optional, Dict
 import os
 from datetime import datetime
 import traceback
+import logging.handlers
 
 # Global logger name
 LOGGER_NAME = "CryptoTrader"
 
-# ANSI color codes for terminal coloring
+# ANSI color codes for terminal coloring - expanded from both files
 COLORS = {
     'RESET': '\033[0m',
+    'BLACK': '\033[30m',
     'RED': '\033[31m',
-    'YELLOW': '\033[33m',
     'GREEN': '\033[32m',
+    'YELLOW': '\033[33m',
     'BLUE': '\033[34m',
     'MAGENTA': '\033[35m',
     'CYAN': '\033[36m',
+    'WHITE': '\033[37m',
+    'BOLD': '\033[1m',
+    'UNDERLINE': '\033[4m',
+    'BRIGHT_RED': '\033[91m',
+    'BRIGHT_GREEN': '\033[92m',
+    'BRIGHT_YELLOW': '\033[93m',
+    'BRIGHT_BLUE': '\033[94m',
+    'BRIGHT_MAGENTA': '\033[95m',
+    'BRIGHT_CYAN': '\033[96m',
+    'BRIGHT_WHITE': '\033[97m',
+    'BG_RED': '\033[41m',
+    'BG_GREEN': '\033[42m',
+    'BG_YELLOW': '\033[43m',
+    'BG_BLUE': '\033[44m',
 }
 
 # Define logging profiles
@@ -98,31 +114,54 @@ class CloudOptimizedFilter(logging.Filter):
         return True
 
 class ColoredFormatter(logging.Formatter):
-    """Custom formatter that adds colors to log messages based on level"""
+    """Enhanced custom formatter that adds colors to log messages based on level"""
     
+    # Define colors for different logging levels (merged from both files)
     LEVEL_COLORS = {
-        logging.DEBUG: '',
-        logging.INFO: '',
+        logging.DEBUG: COLORS['BLUE'],
+        logging.INFO: COLORS['GREEN'],
         logging.WARNING: COLORS['YELLOW'],
         logging.ERROR: COLORS['RED'],
-        logging.CRITICAL: COLORS['RED'],
+        logging.CRITICAL: COLORS['BG_RED'] + COLORS['WHITE'] + COLORS['BOLD'],
     }
     
     def format(self, record):
+        # Get the original formatted message
+        formatted_msg = super().format(record)
+        
         # Add color based on log level
         levelname = record.levelname
-        message = super().format(record)
+        levelno = record.levelno
         
-        # Apply colors based on content
-        if 'ERROR' in message or 'Error' in message:
-            return f"{COLORS['RED']}{message}{COLORS['RESET']}"
-        elif 'WARNING' in message or 'Warning' in message:
-            return f"{COLORS['YELLOW']}{message}{COLORS['RESET']}"
+        # Color the timestamp in cyan if it's in the message
+        if hasattr(record, 'asctime'):
+            formatted_msg = formatted_msg.replace(
+                record.asctime,
+                f"{COLORS['CYAN']}{record.asctime}{COLORS['RESET']}"
+            )
+            
+        # Color the level name with appropriate color
+        level_pattern = f" - {levelname} - "
+        if level_pattern in formatted_msg:
+            color_level = self.LEVEL_COLORS.get(levelno, COLORS['RESET'])
+            formatted_msg = formatted_msg.replace(
+                level_pattern,
+                f" - {color_level}{levelname}{COLORS['RESET']} - "
+            )
+        
+        # Apply colors based on content for keyword highlighting
+        if 'ERROR' in formatted_msg or 'Error' in formatted_msg:
+            return f"{COLORS['RED']}{formatted_msg}{COLORS['RESET']}"
+        elif 'WARNING' in formatted_msg or 'Warning' in formatted_msg:
+            return f"{COLORS['YELLOW']}{formatted_msg}{COLORS['RESET']}"
+        elif 'SUCCESS' in formatted_msg or 'Success' in formatted_msg:
+            return f"{COLORS['GREEN']}{formatted_msg}{COLORS['RESET']}"
         else:
             color = self.LEVEL_COLORS.get(record.levelno, '')
             if color:
-                return f"{color}{message}{COLORS['RESET']}"
-            return message
+                return f"{color}{formatted_msg}{COLORS['RESET']}"
+        
+        return formatted_msg
 
 def setup_logging(
     profile: str = 'default',
@@ -181,7 +220,7 @@ def setup_logging(
     if actual_file_log:
         try:
             # Create logs directory if it doesn't exist
-            logs_dir = 'logs'
+            logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
             if not os.path.exists(logs_dir):
                 os.makedirs(logs_dir)
                 
@@ -195,8 +234,13 @@ def setup_logging(
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             log_file = os.path.join(logs_dir, f'trading_{timestamp}.log')
             
-            # Create the file handler
-            file_handler = logging.FileHandler(log_file)
+            # Create the file handler with rotation support
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=10 * 1024 * 1024,  # 10 MB
+                backupCount=5,
+                encoding='utf-8'
+            )
             file_handler.setFormatter(file_formatter)
             file_handler.setLevel(actual_log_level)
             
@@ -248,70 +292,74 @@ def configure_module_loggers(
         technical_level: Level for technical analysis
         trading_level: Level for trading strategy and order management
     """
-    # Trading strategy logger
-    trading_logger = logging.getLogger(f"{LOGGER_NAME}.trading_strategy")
-    trading_logger.setLevel(trading_level)
+    # Configure API loggers
+    for api_name in ['alpaca_api', 'finnhub_api', 'coinlore_api', 'openai_api']:
+        api_logger = logging.getLogger(api_name)
+        api_logger.setLevel(api_level)
     
-    # Order manager logger
-    order_logger = logging.getLogger(f"{LOGGER_NAME}.order_manager")
-    order_logger.setLevel(trading_level)
-    
-    # Technical analysis loggers
-    technical_logger = logging.getLogger(f"{LOGGER_NAME}.technical")
+    # Configure technical analysis loggers
+    technical_logger = logging.getLogger('CryptoTrader.technical')
     technical_logger.setLevel(technical_level)
     
-    # Background process logger
-    background_logger = logging.getLogger(f"{LOGGER_NAME}.background")
-    background_logger.setLevel(background_level)
+    # Configure technical sub-loggers
+    for tech_name in ['indicators', 'signal_generator']:
+        tech_sub_logger = logging.getLogger(f'CryptoTrader.technical.{tech_name}')
+        tech_sub_logger.setLevel(technical_level)
     
-    # API loggers
-    for api in ['alpaca_api', 'finnhub_api', 'coinlore_api', 'openai_api']:
-        api_logger = logging.getLogger(f"{LOGGER_NAME}.{api}")
-        api_logger.setLevel(api_level)
+    # Configure trading strategy and order management
+    trading_logger = logging.getLogger('trading_strategy')
+    trading_logger.setLevel(trading_level)
+    
+    order_logger = logging.getLogger('order_manager')
+    order_logger.setLevel(trading_level)
+    
+    # Configure on-chain analysis loggers
+    onchain_logger = logging.getLogger('CryptoTrader.onchain')
+    onchain_logger.setLevel(root_level)
+    
+    # Background task loggers
+    background_logger = logging.getLogger('CryptoTrader.background')
+    background_logger.setLevel(background_level)
 
 def get_logger(module_name: str) -> logging.Logger:
     """
-    Get a logger with the specified module name.
+    Get a logger for a specific module.
     
     Args:
-        module_name: Module name (without the LOGGER_NAME prefix)
+        module_name: Name of the module
         
     Returns:
-        Logger instance
+        Configured logger for the module
     """
-    return logging.getLogger(f"{LOGGER_NAME}.{module_name}")
+    if not module_name.startswith(LOGGER_NAME + '.') and module_name != LOGGER_NAME:
+        # If module_name doesn't start with the logger name prefix, add it
+        # But don't add it if it's exactly the logger name
+        if '.' in module_name:
+            # Keep the module hierarchy intact
+            parts = module_name.split('.')
+            if parts[0] != LOGGER_NAME:
+                module_name = f"{LOGGER_NAME}.{module_name}"
+        else:
+            # Simple module name
+            module_name = f"{LOGGER_NAME}.{module_name}"
+    
+    return logging.getLogger(module_name)
 
 def is_cloud_environment():
     """
-    Detect if running in a cloud environment (like Streamlit Cloud)
+    Detect if running in a cloud/production environment.
     
     Returns:
-        True if running in a cloud environment, False otherwise
+        bool: True if running in cloud environment, False otherwise
     """
-    # First check for debug override - if set, force non-cloud mode for debugging
-    debug_override = os.environ.get('DEBUG_OVERRIDE', '').lower()
-    if debug_override in ('true', '1', 'yes'):
-        # Debug override is active, pretend we're not in a cloud environment
-        return False
-    
-    # Check for explicit cloud environment flag
-    explicit_cloud = os.environ.get('STREAMLIT_CLOUD', '').lower()
-    if explicit_cloud in ('true', '1', 'yes'):
-        return True
-    
-    # Check for common cloud environment variables
+    # Check for various cloud environment indicators
     cloud_indicators = [
-        'STREAMLIT_SHARING', 'STREAMLIT_CLOUD',
-        'AWS_LAMBDA_FUNCTION_NAME', 'HEROKU_APP_ID',
-        'DYNO', 'PORT', 'K_SERVICE'
+        os.environ.get('STREAMLIT_SHARING', ''),
+        os.environ.get('STREAMLIT_CLOUD', ''),
+        os.environ.get('AWS_LAMBDA_FUNCTION_NAME', ''),
+        os.environ.get('GOOGLE_CLOUD_PROJECT', ''),
+        os.environ.get('DYNO', ''),  # Heroku
+        os.environ.get('KUBERNETES_SERVICE_HOST', '')
     ]
     
-    for indicator in cloud_indicators:
-        if os.environ.get(indicator):
-            return True
-    
-    # Check if in Docker or containerized environment
-    if os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv'):
-        return True
-        
-    return False 
+    return any(cloud_indicators) 

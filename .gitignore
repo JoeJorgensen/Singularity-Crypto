@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .cursorignore
 .env
-*.env
 .DS_Store
 .vscode/
 keys/

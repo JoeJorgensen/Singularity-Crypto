@@ -1,0 +1,1 @@
+{"trading_active": false, "strategy_mode": "Conservative", "refresh_interval": 15, "selected_timeframe": "1 minute", "selected_candles": 100, "risk_per_trade": 2.0, "max_trades_per_day": 5, "logging_preferences": {"root": 40, "api": 30, "background": 40, "technical": 40, "trading": 40}}

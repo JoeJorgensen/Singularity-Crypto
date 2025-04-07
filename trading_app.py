@@ -29,6 +29,14 @@ from utils.signal_aggregator import SignalAggregator
 from utils.order_manager import OrderManager
 from utils.logging_config import setup_logging, get_logger, is_cloud_environment
 
+# Import price provider components
+from api.price_factory import (
+    create_price_provider,
+    create_price_aggregator,
+    get_default_price_provider
+)
+from api.price_config import PROVIDER_WEIGHTS, DEFAULT_PROVIDER, get_provider_config
+
 # Set up logging based on environment
 if is_cloud_environment():
     # Use cloud profile with reduced logging for better performance
@@ -278,7 +286,8 @@ def load_persistent_state():
         "selected_timeframe": "1 hour",
         "selected_candles": 100,
         "risk_per_trade": 2.0,
-        "max_trades_per_day": 5
+        "max_trades_per_day": 5,
+        "selected_price_provider": "aggregator"
     }
     
     try:
@@ -698,6 +707,36 @@ def initialize_trading_system(config):
         logger.info("Initializing order manager...")
         order_manager = OrderManager(apis['alpaca'], config)
         
+        # Initialize price providers and aggregator
+        logger.info("Initializing price providers...")
+        try:
+            # Initialize all price providers
+            price_aggregator = create_price_aggregator()
+            logger.info(f"Price aggregator initialized with {len(PROVIDER_WEIGHTS)} providers")
+            
+            # Create individual providers for direct access if needed
+            alpaca_provider = create_price_provider("alpaca", alpaca_api=apis.get('alpaca'))
+            alchemy_provider = create_price_provider("alchemy")
+            coingecko_provider = create_price_provider("coingecko")
+            
+            # Store price providers in a dictionary
+            price_providers = {
+                "aggregator": price_aggregator,
+                "alpaca": alpaca_provider,
+                "alchemy": alchemy_provider,
+                "coingecko": coingecko_provider
+            }
+            logger.info("Price providers initialized successfully")
+        except Exception as price_error:
+            logger.error(f"Error initializing price providers: {str(price_error)}")
+            # Create minimal price provider setup
+            price_providers = {
+                "aggregator": None,
+                "alpaca": None,
+                "alchemy": None,
+                "coingecko": None
+            }
+        
         # Initialize is_active flag on the trading strategy based on persistent state
         # This function is called after session state is initialized, so we can use it here
         if 'trading_active' in st.session_state and st.session_state.trading_active:
@@ -712,7 +751,8 @@ def initialize_trading_system(config):
             'position_calculator': position_calculator,
             'signal_aggregator': signal_aggregator,
             'order_manager': order_manager,
-            'apis': apis
+            'apis': apis,
+            'price_providers': price_providers
         }
     except Exception as e:
         logger.error(f"Error during trading system initialization: {str(e)}", exc_info=True)
@@ -723,7 +763,8 @@ def initialize_trading_system(config):
             'position_calculator': None,
             'signal_aggregator': None,
             'order_manager': None,
-            'apis': {}
+            'apis': {},
+            'price_providers': {}
         }
 
 def normalize_timeframe(timeframe):
@@ -927,53 +968,91 @@ def _process_trading_cycle_results(cycle_id, cycle_result, cycle_start_time):
 
 # Get market data with caching
 @st.cache_data(ttl=60)
-def get_crypto_data(_trading_strategy, timeframe='1H', limit=100):
+def get_crypto_data(_trading_strategy, timeframe='1H', limit=100, _price_provider=None):
     """Get historical OHLCV data for the specified cryptocurrency."""
     try:
         # Always use ETH/USD
         symbol = 'ETH/USD'
-        df = _trading_strategy.get_market_data(symbol, timeframe, limit)
-        if df is not None and not df.empty:
-            # Update current price in session state with more detailed logging
-            if 'trading_stats' in st.session_state and len(df) > 0:
-                current_price = df['close'].iloc[-1]
-                
-                # Log the price update for debugging
-                logger.info(f"Updating price from market data: ${current_price:.2f} (timeframe: {timeframe}, data points: {len(df)})")
-                
-                # Set the current price in session state
-                st.session_state.trading_stats["current_price"] = current_price
-                
-                # Also store the data source and timestamp
-                st.session_state.trading_stats["price_data_source"] = f"Alpaca API (timeframe: {timeframe})"
-                st.session_state.trading_stats["price_timestamp"] = datetime.now().strftime('%H:%M:%S')
-                
-            return df
-        else:
-            # Try to get current price from the API directly if DataFrame is empty
+        
+        # Try using the specified price provider if available
+        using_price_provider = False
+        current_price = None
+        price_source = None
+        
+        # Try to get current price from price provider
+        if _price_provider:
             try:
-                if hasattr(_trading_strategy.apis['alpaca'], 'get_current_price'):
-                    current_price = _trading_strategy.apis['alpaca'].get_current_price(symbol)
-                    if current_price and 'trading_stats' in st.session_state:
-                        logger.info(f"Using direct API price: ${current_price:.2f} (fallback)")
-                        st.session_state.trading_stats["current_price"] = current_price
-                        st.session_state.trading_stats["price_data_source"] = "Alpaca API (direct)"
-                        st.session_state.trading_stats["price_timestamp"] = datetime.now().strftime('%H:%M:%S')
-                        
-                        # Create a minimal DataFrame with the current price
-                        minimal_df = pd.DataFrame({
-                            'open': [current_price],
-                            'high': [current_price],
-                            'low': [current_price],
-                            'close': [current_price],
-                            'volume': [0]
-                        }, index=[pd.Timestamp.now()])
-                        return minimal_df
-            except Exception as price_error:
-                logger.error(f"Error getting direct price: {str(price_error)}")
+                # Get current price from the provider
+                logger.info(f"Getting price from {_price_provider.__class__.__name__}")
+                current_price = _price_provider.get_current_price("ETH")
                 
-            st.error("No data received from Alpaca API")
-            return pd.DataFrame()
+                if current_price:
+                    using_price_provider = True
+                    price_source = _price_provider.__class__.__name__
+                    logger.info(f"Got price from {price_source}: ${current_price:.2f}")
+            except Exception as provider_error:
+                logger.error(f"Error getting price from provider: {str(provider_error)}")
+        
+        # Fallback to traditional method if price provider didn't work
+        if not using_price_provider:
+            df = _trading_strategy.get_market_data(symbol, timeframe, limit)
+            if df is not None and not df.empty:
+                # Update current price in session state with more detailed logging
+                if 'trading_stats' in st.session_state and len(df) > 0:
+                    current_price = df['close'].iloc[-1]
+                    price_source = f"Alpaca API (timeframe: {timeframe})"
+                    
+                    # Log the price update for debugging
+                    logger.info(f"Updating price from market data: ${current_price:.2f} (timeframe: {timeframe}, data points: {len(df)})")
+                    
+                    # Set the current price in session state
+                    st.session_state.trading_stats["current_price"] = current_price
+                    
+                    # Also store the data source and timestamp
+                    st.session_state.trading_stats["price_data_source"] = price_source
+                    st.session_state.trading_stats["price_timestamp"] = datetime.now().strftime('%H:%M:%S')
+                    
+                return df
+            else:
+                # Try to get current price from the API directly if DataFrame is empty
+                try:
+                    if hasattr(_trading_strategy.apis['alpaca'], 'get_current_price'):
+                        current_price = _trading_strategy.apis['alpaca'].get_current_price(symbol)
+                        if current_price:
+                            price_source = "Alpaca API (direct)"
+                            logger.info(f"Using direct API price: ${current_price:.2f} (fallback)")
+                except Exception as price_error:
+                    logger.error(f"Error getting direct price: {str(price_error)}")
+        
+        # If we have a current price from any source, update session state and return a minimal dataframe
+        if current_price:
+            if 'trading_stats' in st.session_state:
+                st.session_state.trading_stats["current_price"] = current_price
+                st.session_state.trading_stats["price_data_source"] = price_source or "Unknown source"
+                st.session_state.trading_stats["price_timestamp"] = datetime.now().strftime('%H:%M:%S')
+            
+            # Create a minimal DataFrame with the current price
+            # Instead of just one data point, create multiple points to help technical indicators
+            times = [pd.Timestamp.now() - pd.Timedelta(minutes=i) for i in range(20, -1, -1)]
+            prices = [current_price] * 21  # Same price for all points for simplicity
+            
+            # Create a DataFrame with price data for the last 21 minutes
+            minimal_df = pd.DataFrame({
+                'open': prices,
+                'high': prices,
+                'low': prices, 
+                'close': prices,
+                'volume': [1000] * 21  # Use a non-zero volume value
+            }, index=times)
+            
+            # Sort by timestamp to ensure proper datetime ordering
+            minimal_df = minimal_df.sort_index()
+            
+            logger.info(f"Created minimal dataframe with {len(minimal_df)} rows for technical indicators")
+            return minimal_df
+                
+        st.error("No price data received from any source")
+        return pd.DataFrame()
     except Exception as e:
         st.error(f"Error fetching market data: {str(e)}")
         return pd.DataFrame()
@@ -1050,6 +1129,7 @@ def initialize_session_state():
     st.session_state.selected_candles = persistent_state.get("selected_candles", 100)
     st.session_state.risk_per_trade = persistent_state.get("risk_per_trade", 2.0)
     st.session_state.max_trades_per_day = persistent_state.get("max_trades_per_day", 5)
+    st.session_state.selected_price_provider = persistent_state.get("selected_price_provider", "aggregator")
     
     st.session_state.current_position = None
     st.session_state.latest_signals = None
@@ -1140,21 +1220,16 @@ def main():
         ensure_update_thread()
         
         # Load environment variables
-        env_vars = load_environment_variables()
+        load_environment_variables()
         
         # Create containers for the different sections that we'll update without page refresh
-        header_container = st.container()
-        chart_container = st.container()
         signals_container = st.container()
         trading_details_container = st.container()
         
-        with header_container:
-            # Title and description removed for cleaner UI
-            pass
+        # Header section removed for cleaner UI
         
         # Verify API credentials
-        credentials_available = verify_secrets()
-        if not credentials_available:
+        if not verify_secrets():
             # Show more detailed error with debug information about secrets
             with st.expander("Credentials Debug Information"):
                 st.error("⚠️ API credentials not found! Make sure ALPACA_API_KEY and ALPACA_API_SECRET are set in Streamlit secrets or environment variables.")
@@ -1351,11 +1426,7 @@ def main():
                                 st.markdown(f"**Direction:** <span style='color:{direction_color}'>{signal_direction}</span>", unsafe_allow_html=True)
                                 
                                 # Signal component visualization
-                                if "trade_conditions" in ui_data:
-                                    conditions = ui_data["trade_conditions"]
-                                    # Create columns for each component
-                                    component_cols = st.columns(4)
-                                    
+                                if "trade_conditions" in ui_data or "trade_conditions" in st.session_state.trading_stats:
                                     # Helper function to display a signal component
                                     def signal_indicator(value, name):
                                         # Determine color based on value
@@ -1378,25 +1449,15 @@ def main():
                                         st.markdown(f"<div style='text-align: center;'><span style='font-size: 0.8em; color: #888888;'>{name}</span><br>"
                                                    f"<span style='font-size: 1.2em; font-weight: bold; color: {color};'>{value:.2f}</span></div>",
                                                    unsafe_allow_html=True)
-                                    
-                                    # Display each component
-                                    with component_cols[0]:
-                                        signal_indicator(conditions.get("trend", 0), "Trend")
-                                    
-                                    with component_cols[1]:
-                                        signal_indicator(conditions.get("momentum", 0), "Momentum")
-                                    
-                                    with component_cols[2]:
-                                        signal_indicator(conditions.get("volume", 0), "Volume")
-                                    
-                                    with component_cols[3]:
-                                        signal_indicator(conditions.get("sentiment", 0), "Sentiment")
-                                elif "trade_conditions" in st.session_state.trading_stats:
-                                    conditions = st.session_state.trading_stats["trade_conditions"]
+                                
                                     # Create columns for each component
                                     component_cols = st.columns(4)
                                     
-                                    # Helper function to display a signal component (defined above)
+                                    if "trade_conditions" in ui_data:
+                                        conditions = ui_data["trade_conditions"]
+                                    else:
+                                        conditions = st.session_state.trading_stats["trade_conditions"]
+                                    
                                     # Display each component
                                     with component_cols[0]:
                                         signal_indicator(conditions.get("trend", 0), "Trend")
@@ -1424,16 +1485,16 @@ def main():
         config = load_config()
         
         # Initialize trading system
-        system = initialize_trading_system(config)
-        trading_strategy = system['trading_strategy']
-        risk_manager = system['risk_manager']
-        position_calculator = system['position_calculator']
-        signal_aggregator = system['signal_aggregator']
-        order_manager = system['order_manager']
-        alpaca_api = system['apis'].get('alpaca')
+        trading_system = initialize_trading_system(config)
+        trading_strategy = trading_system['trading_strategy']
+        risk_manager = trading_system['risk_manager']
+        position_calculator = trading_system['position_calculator']
+        signal_aggregator = trading_system['signal_aggregator']
+        order_manager = trading_system['order_manager']
+        alpaca_api = trading_system['apis'].get('alpaca')
         
         # Store system in session state for cleanup function to access
-        st.session_state.system = system
+        st.session_state.system = trading_system
         
         # Check if we have a fully initialized system
         if trading_strategy is None or alpaca_api is None:
@@ -1537,6 +1598,47 @@ def main():
             except Exception as e:
                 st.error(f"Error retrieving account info: {str(e)}")
             
+            # Price data source selection
+            st.subheader("Data Sources")
+            
+            # If price providers are available, add selection options
+            if trading_system and 'price_providers' in trading_system and trading_system['price_providers']:
+                # Store the selected provider in session state if not already there
+                if 'selected_price_provider' not in st.session_state:
+                    st.session_state.selected_price_provider = 'aggregator'
+                
+                # Create radio buttons for price data source selection
+                price_source = st.radio(
+                    "Price Data Source",
+                    ["Aggregator", "Alpaca", "Alchemy", "CoinGecko"],
+                    index=["Aggregator", "Alpaca", "Alchemy", "CoinGecko"].index(
+                        st.session_state.selected_price_provider.capitalize()
+                    ),
+                    horizontal=True,
+                    help="Select which data source to use for price information"
+                )
+                
+                # Convert selection to lowercase for our dictionary keys
+                provider_key = price_source.lower()
+                
+                # Update session state if changed
+                if provider_key != st.session_state.selected_price_provider:
+                    st.session_state.selected_price_provider = provider_key
+                    # Save to persistent state
+                    save_persistent_state({"selected_price_provider": provider_key})
+                    st.success(f"Price data source changed to {price_source}")
+                
+                # Add explanation of the current source
+                if provider_key == 'aggregator':
+                    st.info("Aggregator combines multiple sources with weights: " + 
+                           ", ".join([f"{k} ({v:.1f})" for k, v in PROVIDER_WEIGHTS.items()]))
+                elif provider_key == 'alchemy':
+                    st.info("Alchemy Prices API (Free tier: 300 requests/hour)")
+                elif provider_key == 'coingecko':
+                    st.info("CoinGecko API (Free tier with rate limiting)")
+                elif provider_key == 'alpaca':
+                    st.info("Alpaca API (Same source as trading)")
+            
             # Define timeframe options for internal use (not displayed in UI)
             timeframe_options = {
                 "1 minute": "1Min",
@@ -1551,7 +1653,7 @@ def main():
             # Default to 100 candles if not set in session state
             selected_candles = st.session_state.selected_candles if hasattr(st.session_state, 'selected_candles') else 100
             
-            # Risk parameters 
+            # Risk parameters
             st.subheader("Risk Parameters")
             risk_per_trade = st.slider(
                 "Risk per Trade (%)", 
@@ -1649,7 +1751,7 @@ def main():
                 st.info(descriptions[strategy_mode])
             
             # Create columns for market data and trading interface
-            with chart_container:
+            with signals_container:
                 col1, col2 = st.columns([2, 1])
                 
                 with col1:
@@ -1666,10 +1768,21 @@ def main():
                     """, unsafe_allow_html=True)
                     
                     # Get market data (still needed for signals)
+                    # Get the selected price provider
+                    selected_provider = None
+                    if trading_system and 'price_providers' in trading_system and 'selected_price_provider' in st.session_state:
+                        provider_key = st.session_state.selected_price_provider
+                        
+                        if provider_key in trading_system['price_providers'] and trading_system['price_providers'][provider_key]:
+                            selected_provider = trading_system['price_providers'][provider_key]
+                            logger.info(f"Using {provider_key} price provider for data")
+                    
+                    # Get market data with the selected provider
                     df = get_crypto_data(
                         trading_strategy,
                         timeframe=timeframe_options[selected_timeframe],
-                        limit=selected_candles
+                        limit=selected_candles,
+                        _price_provider=selected_provider
                     )
                     
                     # Run trading cycle every time there's a scheduled update but without full page refresh

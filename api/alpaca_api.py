@@ -2,39 +2,41 @@
 Alpaca API interface for cryptocurrency trading.
 Uses Alpaca's US feed for market data as required by project rules.
 """
-import os
-import time
-import threading
 import json
-import asyncio
-import pandas as pd
-import requests
+import os
+import threading
+import time
 from datetime import datetime, timedelta
+from functools import lru_cache
+
 import aiohttp
 import alpaca
+import asyncio
 import logging
-from dotenv import load_dotenv
-from functools import lru_cache
-import websockets
-from alpaca.data.timeframe import TimeFrameUnit
 import numpy as np
+import pandas as pd
 import random
-
+import requests
+import websockets
+from dotenv import load_dotenv
 
 # Alpaca-py imports
-from alpaca.trading.client import TradingClient, RESTClient as REST
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest
-from alpaca.data.timeframe import TimeFrame
 from alpaca.data.live import CryptoDataStream
-# Don't import CryptoFeed enum since it causes issues in Streamlit cloud
-# from alpaca.data.enums import CryptoFeed 
-from alpaca.data.models import Bar, Trade, Quote
+from alpaca.data.models import Bar, Quote, Trade
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.trading.client import TradingClient, RESTClient as REST
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
+
+from utils.logging_config import get_logger
 
 # Load environment variables
 load_dotenv()
+
+# Get logger
+logger = get_logger('alpaca_api')
 
 class AlpacaAPI:
     def __init__(self, config=None):
@@ -45,7 +47,7 @@ class AlpacaAPI:
             config: Configuration dictionary with Alpaca API credentials
         """
         # Set up logging first thing to avoid attribute errors
-        self.logger = logging.getLogger('alpaca_api')
+        self.logger = logger
         
         # Load configuration
         if config is None:
@@ -918,39 +920,88 @@ class AlpacaAPI:
     def stop_websocket(self):
         """
         Stop the websocket connection.
-        
-        Returns:
-            bool: True if connection stopped successfully, False otherwise
         """
         try:
-            if hasattr(self, '_ws_client') and self._ws_client:
-                # Create a new thread to handle the async closing
+            # Log what we're doing
+            self.logger.info("Stopping websocket connection")
+            
+            # First check if we have a websocket client
+            if self._ws_client is None:
+                self.logger.debug("No websocket client to stop")
+                return
+            
+            # Set flag to prevent reconnection attempts
+            self.ws_connected = False
+            
+            # Close in a separate thread to avoid blocking
+            if self.ws_thread and self.ws_thread.is_alive():
+                # Define function for closing in background
                 def close_websocket():
                     try:
-                        # Create a new event loop for this thread
+                        # Create an event loop for async operations
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         
-                        # Run the stop function in this loop
+                        # Run the stop function
                         loop.run_until_complete(self._stop_websocket_async())
-                        
-                        # Close the loop
                         loop.close()
+                        self.logger.info("Websocket connection closed successfully")
                     except Exception as e:
-                        self.logger.error(f"Error in websocket closing thread: {str(e)}")
+                        self.logger.error(f"Error closing websocket: {str(e)}")
                 
-                # Create and start the thread
-                close_thread = threading.Thread(target=close_websocket, daemon=True)
+                # Start a thread to close the websocket
+                close_thread = threading.Thread(target=close_websocket)
+                close_thread.daemon = True
                 close_thread.start()
-                close_thread.join(timeout=5.0)  # Wait for up to 5 seconds for closing
                 
-                return True
+                # Wait briefly for the thread to complete
+                close_thread.join(timeout=2.0)
+                self.logger.debug("Websocket close thread completed or timed out")
             else:
-                self.logger.info("No websocket connection to stop")
-                return False
+                self.logger.debug("No websocket thread running to stop")
+                
+            # Reset websocket-related variables
+            self.ws_thread = None
+            self._ws_client = None
+            self.ws_subscribed_symbols = []
+            self.ws_connection_time = None
+            
+            self.logger.info("Websocket cleanup completed")
         except Exception as e:
             self.logger.error(f"Error stopping websocket: {str(e)}")
-            return False
+
+    async def _stop_websocket_async(self):
+        """
+        Internal async method to stop the websocket connection.
+        """
+        try:
+            if self._ws_client:
+                self.logger.debug("Stopping websocket client")
+                # Try to call unsubscribe if client supports it
+                try:
+                    if hasattr(self._ws_client, 'unsubscribe'):
+                        for symbol in self.ws_subscribed_symbols:
+                            await self._ws_client.unsubscribe(symbol)
+                            self.logger.debug(f"Unsubscribed from {symbol}")
+                except Exception as e:
+                    self.logger.warning(f"Error during unsubscribe: {str(e)}")
+                
+                # Try to gracefully close the connection
+                try:
+                    if hasattr(self._ws_client, 'close'):
+                        self.logger.debug("Closing websocket connection")
+                        await self._ws_client.close()
+                        self.logger.debug("Websocket connection closed")
+                except Exception as e:
+                    self.logger.warning(f"Error closing websocket connection: {str(e)}")
+                
+                # Reset the client
+                self._ws_client = None
+                self.logger.debug("Websocket client reset")
+            else:
+                self.logger.debug("No websocket client to stop")
+        except Exception as e:
+            self.logger.error(f"Error in _stop_websocket_async: {str(e)}")
 
     def get_latest_websocket_data(self, symbol):
         """
@@ -1774,167 +1825,57 @@ class AlpacaAPI:
             self.logger.error(f"Error parsing timeframe '{timeframe}': {e}. Using default 1Hour")
             return "1Hour"
 
-    async def _stop_websocket_async(self):
-        """Async helper to stop the websocket connection."""
-        try:
-            if hasattr(self, '_ws_client') and self._ws_client:
-                self.logger.info("Stopping websocket connection...")
-                
-                # Check what kind of client we have and use appropriate method to stop it
-                if hasattr(self._ws_client, 'close'):
-                    try:
-                        await self._ws_client.close()
-                        self.logger.info("Closed websocket connection with close() method")
-                    except Exception as e:
-                        self.logger.warning(f"Error calling close() on websocket client: {e}")
-                
-                elif hasattr(self._ws_client, 'stop'):
-                    try:
-                        self._ws_client.stop()
-                        self.logger.info("Stopped websocket connection with stop() method")
-                        # Wait a moment for it to process
-                        await asyncio.sleep(0.5)
-                    except Exception as e:
-                        self.logger.warning(f"Error calling stop() on websocket client: {e}")
-                
-                else:
-                    # If no standard method exists, try to disconnect or cleanup
-                    self.logger.warning("No standard close/stop method found on websocket client")
-                    if hasattr(self._ws_client, 'disconnect'):
-                        try:
-                            self._ws_client.disconnect()
-                            self.logger.info("Disconnected websocket with disconnect() method")
-                        except Exception as e:
-                            self.logger.warning(f"Error disconnecting websocket: {e}")
-                
-                # Clear the client reference
-                self._ws_client = None
-                
-                # Cancel monitor thread if it exists
-                if hasattr(self, '_ws_monitor_thread') and self._ws_monitor_thread:
-                    try:
-                        self._ws_monitor_thread.cancel()
-                        self.logger.info("Stopped websocket monitor thread")
-                    except Exception as e:
-                        self.logger.warning(f"Error stopping monitor thread: {e}")
-                    self._ws_monitor_thread = None
-                
-                # Reset connection state
-                self.ws_connected = False
-                self.logger.info("Websocket connection stopped")
-                return True
-            else:
-                self.logger.info("No websocket connection to stop")
-                return False
-        except Exception as e:
-            self.logger.error(f"Error stopping websocket: {str(e)}")
-            self.ws_connected = False
-            return False
-
-    def stop_websocket(self):
-        """Stop the websocket connection."""
-        try:
-            if hasattr(self, '_ws_client') and self._ws_client:
-                # Create a new thread to handle the async closing
-                def close_websocket():
-                    try:
-                        # Create a new event loop for this thread
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        
-                        # Run the stop function in this loop
-                        loop.run_until_complete(self._stop_websocket_async())
-                        
-                        # Close the loop
-                        loop.close()
-                    except Exception as e:
-                        self.logger.error(f"Error in websocket closing thread: {str(e)}")
-                
-                # Create and start the thread
-                close_thread = threading.Thread(target=close_websocket, daemon=True)
-                close_thread.start()
-                close_thread.join(timeout=5.0)  # Wait for up to 5 seconds for closing
-                
-                return True
-            else:
-                self.logger.info("No websocket connection to stop")
-                return False
-        except Exception as e:
-            self.logger.error(f"Error stopping websocket: {str(e)}")
-            return False
-
     def start_price_cache_updater(self, symbols=None):
         """
-        Start a background thread to periodically update the price cache for specified symbols.
+        Start a background thread to periodically update the price cache.
         
         Args:
-            symbols: List of symbols to cache prices for (default: ETH/USD only)
-            
-        Returns:
-            bool: True if started, False if already running
+            symbols: List of symbols to monitor (default: ETH/USD)
         """
-        if self.price_cache_updater_running:
-            self.logger.info("Price cache updater already running")
-            return False
-            
-        # Default to only ETH/USD if not provided
-        if not symbols:
+        # If no symbols specified, default to ETH/USD
+        if symbols is None:
             symbols = ['ETH/USD']
-            
-        self.logger.info(f"Starting price cache updater for symbols: {symbols}")
+        
+        # If already running, don't start again
+        if self.price_cache_updater_running:
+            self.logger.debug("Price cache updater already running")
+            return
+        
+        self.logger.info(f"Starting price cache updater for {symbols}")
         
         def update_price_cache():
+            """Background function to periodically update price cache"""
             self.price_cache_updater_running = True
+            
             while self.price_cache_updater_running:
                 try:
                     # Update price for each symbol
                     for symbol in symbols:
                         try:
-                            # Try different timeframes if 1Min fails
-                            price = None
-                            for timeframe in ['1Min', '5Min', '15Min', '1H']:
-                                try:
-                                    bars = self.get_crypto_bars(symbol, timeframe, 1)
-                                    if not bars.empty:
-                                        price = bars['close'].iloc[-1]
-                                        # Update the price cache
-                                        self.last_known_prices[symbol] = price
-                                        self.last_price_update_time[symbol] = datetime.now()
-                                        self.logger.debug(f"Updated price cache for {symbol}: ${price} using {timeframe} timeframe")
-                                        break
-                                except Exception as tf_error:
-                                    continue
-                                    
-                            # Also try websocket data if available
-                            if price is None:
-                                try:
-                                    ws_data = self.get_latest_websocket_data(symbol)
-                                    if ws_data and ws_data['close'] is not None:
-                                        price = ws_data['close']
-                                        # Update the price cache
-                                        self.last_known_prices[symbol] = price
-                                        self.last_price_update_time[symbol] = datetime.now()
-                                        self.logger.debug(f"Updated price cache for {symbol}: ${price} from websocket")
-                                except Exception:
-                                    pass
-                                    
-                        except Exception as symbol_error:
-                            self.logger.warning(f"Error updating price cache for {symbol}: {symbol_error}")
+                            # Get current price - directly from API to ensure freshness
+                            # but with rate limiting to avoid excessive API calls
+                            self.check_rate_limit()
+                            price = self.get_current_price(symbol)
+                            
+                            if price is not None and price > 0:
+                                # Store in cache with timestamp
+                                with self.ws_lock:
+                                    self.last_known_prices[symbol] = price
+                                    self.last_price_update_time[symbol] = time.time()
+                                self.logger.debug(f"Updated price cache for {symbol}: {price}")
+                        except Exception as e:
+                            self.logger.warning(f"Error updating price for {symbol}: {str(e)}")
                     
                     # Sleep before next update
                     time.sleep(self.price_update_interval)
-                    
                 except Exception as e:
-                    self.logger.error(f"Error in price cache updater: {e}")
-                    time.sleep(5)  # Wait a bit before retrying
-                    
-        # Start the thread
-        self.price_cache_updater_thread = threading.Thread(
-            target=update_price_cache,
-            daemon=True
-        )
+                    self.logger.error(f"Error in price cache updater: {str(e)}")
+                    time.sleep(5)  # Sleep before retry
+        
+        # Start thread for price updates
+        self.price_cache_updater_thread = threading.Thread(target=update_price_cache, daemon=True)
         self.price_cache_updater_thread.start()
-        return True
+        self.logger.info("Price cache updater started successfully")
     
     def stop_price_cache_updater(self):
         """Stop the price cache updater thread."""

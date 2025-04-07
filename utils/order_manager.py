@@ -3,7 +3,8 @@ OrderManager - Manages trading orders and execution.
 """
 from typing import Dict, List, Optional
 import logging
-from api.alpaca_api import AlpacaAPI
+# Fix circular import by using type hints differently
+# from api.alpaca_api import AlpacaAPI
 from utils.logging_config import get_logger
 from datetime import datetime
 import time
@@ -16,7 +17,7 @@ class OrderManager:
     Manages trading orders and execution.
     """
     
-    def __init__(self, alpaca_api: AlpacaAPI, config: Dict):
+    def __init__(self, alpaca_api, config: Dict):
         """
         Initialize OrderManager.
         

@@ -3,12 +3,13 @@ Signal generator for cryptocurrency trading.
 Implements signal generation from technical indicators.
 """
 from typing import Dict, List, Optional, Union
-import pandas as pd
+
 import numpy as np
-import logging
+import pandas as pd
+from utils.logging_config import get_logger
 
 # Get logger
-logger = logging.getLogger('CryptoTrader.technical.signal_generator')
+logger = get_logger('CryptoTrader.technical.signal_generator')
 
 class SignalGenerator:
     """
@@ -44,7 +45,7 @@ class SignalGenerator:
     
     def generate_trend_signal(self, df: pd.DataFrame) -> float:
         """
-        Generate trend signal from moving averages.
+        Generate trend signal from moving averages and trend indicators.
         
         Args:
             df: DataFrame with technical indicators
@@ -54,13 +55,20 @@ class SignalGenerator:
         """
         signals = []
         
-        # Current price
+        # Safety check - if dataframe is empty or too small
+        if df is None or df.empty or len(df) < 2:
+            logger.warning("DataFrame is empty or too small for trend signal calculation")
+            return 0.0
+            
+        # Get current price
         if 'close' not in df.columns:
-            logger.warning("No 'close' column found in dataframe for trend signal calculation")
-            return 0
-        
+            logger.warning("No 'close' column found for trend signal calculation")
+            return 0.0
+            
         current_price = df['close'].iloc[-1]
-        logger.debug(f"Current price for trend signal: {current_price}")
+        if pd.isna(current_price):
+            logger.warning("Current price is NaN, cannot calculate trend signal")
+            return 0.0
         
         # EMA signals
         if 'ema_9' in df.columns and 'ema_21' in df.columns:
@@ -158,6 +166,21 @@ class SignalGenerator:
             Momentum signal value (-1.0 to 1.0)
         """
         signals = []
+        
+        # Safety check - if dataframe is empty or too small
+        if df is None or df.empty or len(df) < 2:
+            logger.warning("DataFrame is empty or too small for momentum signal calculation")
+            return 0.0
+            
+        # Get current price
+        if 'close' not in df.columns:
+            logger.warning("No 'close' column found for momentum signal calculation")
+            return 0.0
+        
+        current_price = df['close'].iloc[-1]
+        if pd.isna(current_price):
+            logger.warning("Current price is NaN, cannot calculate momentum signal")
+            return 0.0
         
         # RSI signal
         if 'rsi' in df.columns:
@@ -279,10 +302,24 @@ class SignalGenerator:
         """
         signals = []
         
+        # Safety check - if dataframe is empty or too small
+        if df is None or df.empty or len(df) < 2:
+            logger.warning("DataFrame is empty or too small for volatility signal calculation")
+            return 0.0
+            
+        # Get current price
+        if 'close' not in df.columns:
+            logger.warning("No 'close' column found for volatility signal calculation")
+            return 0.0
+        
+        current_price = df['close'].iloc[-1]
+        if pd.isna(current_price):
+            logger.warning("Current price is NaN, cannot calculate volatility signal")
+            return 0.0
+        
         # ATR-based signal
         if 'atr' in df.columns and 'close' in df.columns:
             atr = df['atr'].iloc[-1]
-            current_price = df['close'].iloc[-1]
             
             if not pd.isna(atr) and not pd.isna(current_price) and current_price > 0:
                 # Convert ATR to percentage
@@ -337,7 +374,7 @@ class SignalGenerator:
     
     def generate_volume_signal(self, df: pd.DataFrame) -> float:
         """
-        Generate volume signal.
+        Generate volume signal from volume indicators.
         
         Args:
             df: DataFrame with technical indicators
@@ -347,10 +384,20 @@ class SignalGenerator:
         """
         signals = []
         
-        if 'volume' not in df.columns or len(df) < 20:
-            logger.warning(f"Volume data not available or insufficient for signal calculation. Columns: {df.columns.tolist()}")
-            # Force a small neutral signal to avoid exactly zero
-            return 0.01
+        # Safety check - if dataframe is empty or too small
+        if df is None or df.empty or len(df) < 2:
+            logger.warning("DataFrame is empty or too small for volume signal calculation")
+            return 0.0
+            
+        # Check if 'volume' column exists
+        if 'volume' not in df.columns:
+            logger.warning("Volume data not available for signal calculation")
+            return 0.0
+            
+        # Skip all volume calculations if all volume values are zero (or very close to zero)
+        if df['volume'].max() < 0.1:
+            logger.warning("Volume data is all zero, skipping volume signal calculation")
+            return 0.01  # Return very small positive value instead of exact zero
             
         try:
             # Get current and previous volumes
