@@ -1611,8 +1611,8 @@ def main():
                 price_source = st.radio(
                     "Price Data Source",
                     ["Aggregator", "Alpaca", "Alchemy", "CoinGecko"],
-                    index=["Aggregator", "Alpaca", "Alchemy", "CoinGecko"].index(
-                        st.session_state.selected_price_provider.capitalize()
+                    index=["aggregator", "alpaca", "alchemy", "coingecko"].index(
+                        st.session_state.selected_price_provider
                     ),
                     horizontal=True,
                     help="Select which data source to use for price information"
